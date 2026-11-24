@@ -1,4 +1,4 @@
-"""Windows desktop frontend for simulated square-wave evaluation."""
+"""Windows desktop frontend for square-wave evaluation."""
 
 from datetime import datetime
 from pathlib import Path
@@ -11,13 +11,14 @@ from PySide6.QtGui import QFont
 from PySide6 import QtWidgets as W
 from serial.tools.list_ports import comports
 
-from waveform_core.reference_alignment import DEFAULT_ALIGNMENT_TOLERANCE_PCT
+from waveform_core.reference_alignment import AXIS_LABELS, DEFAULT_ALIGNMENT_TOLERANCE_PCT
 from waveform_simulation import (
     DEFAULT_FREQUENCY,
     DEFAULT_RAW_LIMIT,
     DEFAULT_WIDTH,
+    FileEvaluationSettings,
     SimulationSettings,
-    run_simulation,
+    run_evaluation,
     scan_axis,
 )
 
@@ -46,6 +47,11 @@ QLabel[role="verdict"] {
 QLabel[role="verdict"][state="pass"] { color: #17614c; background: #ddf2e9; }
 QLabel[role="verdict"][state="fail"] { color: #a13631; background: #fee9e7; }
 QLabel[role="verdict"][state="review"] { color: #79551b; background: #fff1d2; }
+QLabel[role="adjustment"] {
+    color: #3d5770; background: #edf2f7; border-radius: 6px; padding: 2px 8px; font-weight: 700;
+}
+QLabel[role="adjustment"][state="trial"] { color: #ffffff; background: #087486; }
+QLabel[role="adjustment"][state="review"] { color: #79551b; background: #fff1d2; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPushButton {
     background: #f7f9fc; border: 1px solid #d8e3ee; border-radius: 6px;
     padding: 4px 8px; min-height: 22px;
@@ -80,7 +86,7 @@ def card():
     return frame
 
 
-class SimulationThread(QThread):
+class EvaluationThread(QThread):
     directory_ready = Signal(object)
     measurement_ready = Signal(object)
 
@@ -91,8 +97,8 @@ class SimulationThread(QThread):
         self.outcome = None
 
     def run(self):
-        self.outcome = run_simulation(self.settings, self.cancelled,
-                                      self.directory_ready.emit, self.measurement_ready.emit)
+        self.outcome = run_evaluation(self.settings, self.cancelled,
+                                     self.directory_ready.emit, self.measurement_ready.emit)
 
 
 class WaveformWindow(W.QMainWindow):
@@ -101,6 +107,7 @@ class WaveformWindow(W.QMainWindow):
         self.setWindowTitle("方波自动化 · 波形评价")
         self.worker = None
         self.closing = False
+        self.waveform_directory = ""
         self.setStyleSheet(STYLE)
         self.setMinimumSize(820, 480)
 
@@ -112,7 +119,8 @@ class WaveformWindow(W.QMainWindow):
         header = W.QHBoxLayout()
         header.addWidget(label("方波自动化", "title"))
         header.addStretch()
-        header.addWidget(label("模拟模式", "mode"))
+        self.mode = label("模拟模式", "mode")
+        header.addWidget(self.mode)
         root.addLayout(header)
 
         splitter = W.QSplitter(Qt.Orientation.Vertical)
@@ -134,7 +142,7 @@ class WaveformWindow(W.QMainWindow):
         self.resize(min(1240, screen.width() - 36), min(790, screen.height() - 52))
         self.clear_measurement()
         self.set_busy(False)
-        self.append_log("等待开始模拟采集。")
+        self.append_log("可开始模拟采集或打开波形文件。")
 
     def build_controls(self):
         panel = card()
@@ -221,6 +229,9 @@ class WaveformWindow(W.QMainWindow):
         for button in (self.start_button, self.stop_button, self.single_button):
             actions.addWidget(button, 1)
         layout.addLayout(actions)
+        self.open_button = W.QPushButton("打开波形文件…")
+        self.open_button.clicked.connect(self.open_waveform)
+        layout.addWidget(self.open_button)
         return panel
 
     @staticmethod
@@ -293,24 +304,42 @@ class WaveformWindow(W.QMainWindow):
         metrics.addWidget(label("整次采集评价", "section"))
         metrics.addWidget(self.verdict, alignment=Qt.AlignmentFlag.AlignLeft)
         metrics.addSpacing(5)
-        metrics.addWidget(label("最大红蓝偏差", "muted"))
+
+        values = W.QGridLayout()
+        values.setHorizontalSpacing(9)
+        values.setVerticalSpacing(2)
+        values.addWidget(label("最大红蓝偏差", "muted"), 0, 0)
+        values.addWidget(label("最大原始不平度", "muted"), 0, 1)
         self.alignment_value = label("—", "value")
-        self.alignment_limit = label("", "muted")
-        metrics.addWidget(self.alignment_value)
-        metrics.addWidget(self.alignment_limit)
-        metrics.addSpacing(3)
-        metrics.addWidget(label("最大原始不平度", "muted"))
         self.raw_value = label("—", "value")
+        self.alignment_limit = label("", "muted")
         self.raw_threshold = label("", "muted")
-        metrics.addWidget(self.raw_value)
-        metrics.addWidget(self.raw_threshold)
+        values.addWidget(self.alignment_value, 1, 0)
+        values.addWidget(self.raw_value, 1, 1)
+        values.addWidget(self.alignment_limit, 2, 0)
+        values.addWidget(self.raw_threshold, 2, 1)
+        metrics.addLayout(values)
+
+        metrics.addSpacing(4)
+        metrics.addWidget(label("本步 y 调整建议", "section"))
+        adjustments = W.QGridLayout()
+        adjustments.setHorizontalSpacing(8)
+        adjustments.setVerticalSpacing(4)
+        self.axis_advice = {}
+        for row, (axis, area) in enumerate(AXIS_LABELS.items()):
+            adjustments.addWidget(label(f"{axis} · {area}"), row, 0)
+            value = label("—", "adjustment")
+            value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.axis_advice[axis] = value
+            adjustments.addWidget(value, row, 1)
+        metrics.addLayout(adjustments)
         metrics.addWidget(self.pulse_caption)
         self.reason = label("", "muted")
         self.reason.setWordWrap(True)
         metrics.addWidget(self.reason)
         metrics.addStretch()
         results = W.QWidget()
-        results.setFixedWidth(176)
+        results.setFixedWidth(208)
         results.setLayout(metrics)
         content.addWidget(results)
         layout.addLayout(content, 1)
@@ -355,13 +384,16 @@ class WaveformWindow(W.QMainWindow):
         self.form.setEnabled(not busy)
         self.start_button.setEnabled(not busy)
         self.single_button.setEnabled(not busy)
+        self.open_button.setEnabled(not busy)
         self.stop_button.setEnabled(busy)
 
-    def run_settings(self, single):
+    def destination_path(self):
         destination = self.destination.text().strip()
         if not destination:
             raise ValueError("请选择保存目录。")
+        return Path(destination).expanduser().resolve()
 
+    def run_settings(self, single):
         def axis(widgets, name):
             if single:
                 start = widgets[0].value()
@@ -369,8 +401,26 @@ class WaveformWindow(W.QMainWindow):
             return scan_axis(*(widget.value() for widget in widgets), name)
 
         return SimulationSettings(axis(self.frequencies, "重频"), axis(self.widths, "脉宽"),
-                                  Path(destination).expanduser().resolve(), self.scope_ip.text().strip(),
+                                  self.destination_path(), self.scope_ip.text().strip(),
                                   self.board_port.currentData(), self.alignment.value(), self.raw_limit.value())
+
+    def open_waveform(self):
+        if self.worker is not None:
+            return
+        try:
+            destination = self.destination_path()
+        except (OSError, ValueError) as error:
+            self.append_log(f"参数有误。{error}")
+            self.progress_label.setText("请检查参数")
+            return
+        selected, _ = W.QFileDialog.getOpenFileName(
+            self, "打开波形文件", self.waveform_directory, "波形文件 (*.csv *.npz)")
+        if not selected:
+            return
+        source = Path(selected)
+        self.waveform_directory = str(source.parent)
+        thresholds = dict(alignment_tolerance_pct=self.alignment.value(), raw_limit_pct=self.raw_limit.value())
+        self.start_evaluation(FileEvaluationSettings(source, destination, thresholds))
 
     def start_run(self, *, single):
         if self.worker is not None:
@@ -381,15 +431,33 @@ class WaveformWindow(W.QMainWindow):
             self.append_log(f"参数有误。{error}")
             self.progress_label.setText("请检查参数")
             return
+        self.start_evaluation(settings)
+
+    def start_evaluation(self, settings):
         self.clear_measurement()
         self.progress.setMaximum(settings.count)
-        self.progress_label.setText(f"0 / {settings.count} 个工况")
-        self.set_verdict("采集中")
-        self.alignment_limit.setText(f"允许 ±{settings.alignment_tolerance_pct:g}%")
-        self.raw_threshold.setText(f"要求 <{settings.raw_limit_pct:g}%")
+        file_mode = isinstance(settings, FileEvaluationSettings)
+        self.mode.setText("文件评价" if file_mode else "模拟模式")
+        if file_mode:
+            source = settings.source_file
+            name = self.condition.fontMetrics().elidedText(source.name, Qt.TextElideMode.ElideMiddle, 190)
+            self.condition.setText(name)
+            self.condition.setToolTip(str(source))
+            self.progress_label.setText("读取文件…")
+            self.set_verdict("评价中")
+            self.append_log(f"打开波形文件  {source}")
+        else:
+            self.progress_label.setText(f"0 / {settings.count} 个工况")
+            self.set_verdict("采集中")
+            if settings.count == 1:
+                self.append_log("开始模拟评价，共 1 个工况。")
+            else:
+                self.append_log(f"开始模拟扫描，共 {settings.count} 个工况。")
+        thresholds = settings.thresholds
+        self.alignment_limit.setText(f"允许 ±{thresholds['alignment_tolerance_pct']:g}%")
+        self.raw_threshold.setText(f"要求 <{thresholds['raw_limit_pct']:g}%")
         self.set_busy(True)
-        self.append_log("开始模拟单次评价。" if single else f"开始模拟扫描，共 {settings.count} 个工况。")
-        worker = SimulationThread(settings, self)
+        worker = EvaluationThread(settings, self)
         self.worker = worker
         worker.directory_ready.connect(self.show_directory)
         worker.measurement_ready.connect(self.show_measurement)
@@ -410,6 +478,7 @@ class WaveformWindow(W.QMainWindow):
     def finish_run(self):
         worker = self.worker
         outcome = worker.outcome
+        file_mode = isinstance(worker.settings, FileEvaluationSettings)
         stopped = worker.cancelled.is_set()
         self.worker = None
         worker.deleteLater()
@@ -417,16 +486,24 @@ class WaveformWindow(W.QMainWindow):
             self.clear_measurement()
         if outcome.status == "failed":
             condition = outcome.condition
-            point = f"  {condition[0]} kHz · {condition[1]} ns" if condition else ""
+            if file_mode:
+                point = worker.settings.source_file.name
+            else:
+                point = f"{condition[0]} kHz · {condition[1]} ns" if condition else ""
             self.progress_label.setText("运行失败")
             if self.progress.value() == 0:
-                self.condition.setText(point.strip())
+                if not file_mode:
+                    self.condition.setText(point)
                 self.set_verdict("待复核", "review")
                 self.reason.setText(outcome.error)
-            self.append_log(f"运行失败{point}。{outcome.error}")
+            self.append_log(f"运行失败  {point}  {outcome.error}")
         elif stopped or outcome.status == "stopped":
             self.progress_label.setText("已停止")
-            self.append_log(f"流程已停止，已保存 {outcome.saved} 个工况。")
+            unit = "份文件结果" if file_mode else "个工况"
+            self.append_log(f"流程已停止，已保存 {outcome.saved} {unit}。")
+        elif file_mode:
+            self.progress_label.setText("文件评价完成")
+            self.append_log("文件评价完成，已保存结果。")
         else:
             self.progress_label.setText(f"已完成  {outcome.saved} / {worker.settings.count}")
             self.append_log(f"流程完成，已保存 {outcome.saved} 个工况。")
@@ -440,6 +517,27 @@ class WaveformWindow(W.QMainWindow):
         self.verdict.style().unpolish(self.verdict)
         self.verdict.style().polish(self.verdict)
 
+    def show_axis_advice(self, shape=None):
+        candidate = shape.get("candidate") if shape else None
+        for axis, value in self.axis_advice.items():
+            state = ""
+            if shape is None:
+                text = "—"
+            elif candidate and axis == candidate["axis"]:
+                step = candidate["step"]
+                direction = "增大" if step > 0 else "减小"
+                text, state = f"{direction} {step:+d}", "trial"
+            elif candidate:
+                text = "本步保持"
+            elif shape["status"] == "flat":
+                text = "保持"
+            else:
+                text, state = "待复核", "review"
+            value.setText(text)
+            value.setProperty("state", state)
+            value.style().unpolish(value)
+            value.style().polish(value)
+
     def reset_zoom(self):
         self.plot.enableAutoRange()
         self.plot.autoRange()
@@ -450,7 +548,9 @@ class WaveformWindow(W.QMainWindow):
         self.zoom_button.setEnabled(False)
         self.progress.setValue(0)
         self.condition.clear()
+        self.condition.setToolTip("")
         self.set_verdict("待采集")
+        self.show_axis_advice()
         for value in (self.alignment_value, self.raw_value):
             value.setText("—")
         for value in (self.alignment_limit, self.raw_threshold, self.pulse_caption, self.reason):
@@ -459,7 +559,9 @@ class WaveformWindow(W.QMainWindow):
     def show_measurement(self, measurement):
         report = measurement.report
         shape, flatness = report["shape"], report["flatness"]
-        point = f"{measurement.frequency_khz} kHz · {measurement.width_ns} ns"
+        file_mode = measurement.source_file is not None
+        point = (measurement.source_file.name if file_mode
+                 else f"{measurement.frequency_khz} kHz · {measurement.width_ns} ns")
         alignment = shape["score_pct"]
         aligned_value = "—" if alignment is None else f"{alignment:.2f}%"
         raw_value = f"{flatness['raw_max_pct']:.2f}%"
@@ -467,13 +569,15 @@ class WaveformWindow(W.QMainWindow):
                         f"已保存 {measurement.capture_path.name}")
         if self.worker.cancelled.is_set():
             return
-        self.condition.setText(point)
         self.progress.setValue(measurement.index)
-        self.progress_label.setText(f"{measurement.index} / {self.worker.settings.count} 个工况")
+        if not file_mode:
+            self.condition.setText(point)
+            self.progress_label.setText(f"{measurement.index} / {self.worker.settings.count} 个工况")
         states = {"达标": "pass", "未达标": "fail", "待复核": "review"}
         self.set_verdict(measurement.verdict, states[measurement.verdict])
         self.alignment_value.setText(aligned_value)
         self.raw_value.setText(raw_value)
+        self.show_axis_advice(shape)
         pulse = measurement.pulse
         self.pulse_caption.setText(f"{len(flatness['pulses'])} 个完整脉冲 · 图示第 {pulse['number']} 个")
         self.reason.setText("保持期不平度超限。" if shape["status"] == "flat" and not report["passed"]

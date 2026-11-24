@@ -11,7 +11,9 @@ from waveform_core.timing_pulses import prepare_timed_file
 from waveform_simulation import (
     DEFAULT_FREQUENCY,
     DEFAULT_WIDTH,
+    FileEvaluationSettings,
     SimulationSettings,
+    run_evaluation,
     run_simulation,
     scan_axis,
     simulate_capture,
@@ -110,6 +112,51 @@ class SimulationTests(unittest.TestCase):
             summary = summary_for(outcome)
             self.assertEqual(summary["failed_condition"], [80, 200])
             self.assertEqual(len(summary["measurements"]), 1)
+
+    def test_file_evaluation_uses_file_samples_and_current_thresholds(self):
+        time_s, voltage_v = simulate_capture(190, 150, 12)
+        thresholds = dict(alignment_tolerance_pct=3.0, raw_limit_pct=12.5)
+        with TemporaryDirectory() as temporary:
+            destination = Path(temporary)
+            csv = destination / "波形.csv"
+            npz = destination / "波形.npz"
+            np.savetxt(csv, np.column_stack((time_s, voltage_v)), delimiter=",",
+                       header="time_s,voltage_v", comments="")
+            np.savez_compressed(npz, time_s=time_s, voltage_v=voltage_v)
+            for source in (csv, npz):
+                with self.subTest(source=source.name):
+                    original = source.read_bytes()
+                    results = []
+                    settings = FileEvaluationSettings(source, destination, thresholds)
+                    outcome = run_evaluation(settings, Event(), lambda _: None, results.append)
+                    self.assertEqual((outcome.status, outcome.saved), ("completed", 1))
+                    measurement, = results
+                    self.assertEqual(measurement.source_file, source)
+                    self.assertIsNone(measurement.frequency_khz)
+                    self.assertEqual(measurement.report["thresholds"], thresholds)
+                    self.assertEqual(len(measurement.report["flatness"]["pulses"]), 3)
+                    summary = summary_for(outcome)
+                    self.assertEqual(summary["mode"], "file")
+                    self.assertEqual(summary["source_file"], str(source))
+                    self.assertEqual(source.read_bytes(), original)
+                    with np.load(measurement.capture_path, allow_pickle=False) as saved:
+                        np.testing.assert_array_equal(saved["time_s"], time_s)
+                        np.testing.assert_array_equal(saved["voltage_v"], voltage_v)
+
+    def test_malformed_file_has_readable_error_and_no_capture(self):
+        with TemporaryDirectory() as temporary:
+            destination = Path(temporary)
+            source = destination / "invalid.csv"
+            source.write_text("wrong,header\n1,2\n", encoding="utf-8")
+            settings = FileEvaluationSettings(source, destination,
+                                              dict(alignment_tolerance_pct=7.0, raw_limit_pct=20.0))
+            results = []
+            outcome = run_evaluation(settings, Event(), lambda _: None, results.append)
+            self.assertEqual((outcome.status, outcome.saved), ("failed", 0))
+            self.assertIn("CSV表头", outcome.error)
+            self.assertFalse(results)
+            self.assertFalse(list(outcome.directory.glob("*.npz")))
+            self.assertEqual(summary_for(outcome)["source_file"], str(source))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Generate, evaluate, and save simulated captures for the desktop frontend."""
+"""Evaluate and save generated captures or waveform files for the desktop frontend."""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +13,7 @@ import numpy as np
 
 from fiber1100_algorithm import evaluate_shape_record
 from waveform_core.timing_pulses import prepare_timed_waveform
+from waveform_core.waveform_io import load_waveform
 
 
 DEFAULT_FREQUENCY = (80, 200, 20)
@@ -74,13 +75,23 @@ class SimulationSettings:
 
 
 @dataclass(frozen=True)
+class FileEvaluationSettings:
+    source_file: Path
+    destination: Path
+    thresholds: dict[str, float]
+
+    count = 1
+
+
+@dataclass(frozen=True)
 class Measurement:
     index: int
-    frequency_khz: int
-    width_ns: int
+    frequency_khz: int | None
+    width_ns: int | None
     capture_path: Path
     report: dict
     pulse: dict
+    source_file: Path | None = None
 
     @property
     def verdict(self):
@@ -133,42 +144,64 @@ def write_summary(directory, summary):
 
 
 def run_simulation(settings, cancelled, on_started, on_measurement, *, interval_s=0.20):
-    """Run acquisition and I/O in the calling thread, publishing only saved captures."""
+    return run_evaluation(settings, cancelled, on_started, on_measurement, interval_s=interval_s)
+
+
+def run_evaluation(settings: SimulationSettings | FileEvaluationSettings,
+                   cancelled, on_started, on_measurement, *, interval_s=0.20):
+    """Read, evaluate and save in the calling thread, publishing only saved captures."""
     directory = condition = None
     entries = []
     status = "running"
     error = ""
+    source_file = settings.source_file if isinstance(settings, FileEvaluationSettings) else None
     now = datetime.now().astimezone()
-    summary = dict(mode="simulation", status=status, started_at=now.isoformat(),
-                   scope_ip=settings.scope_ip, board_port=settings.board_port,
-                   thresholds=settings.thresholds, total=settings.count, measurements=entries)
-    for name, axis in (("frequency_khz", settings.frequencies), ("width_ns", settings.widths)):
-        summary[name] = dict(start=axis.start, end=axis.stop - 1, step=axis.step)
+    summary = dict(status=status, started_at=now.isoformat(), thresholds=settings.thresholds,
+                   total=settings.count, measurements=entries)
+    if source_file is None:
+        summary.update(mode="simulation", scope_ip=settings.scope_ip, board_port=settings.board_port)
+        for name, axis in (("frequency_khz", settings.frequencies), ("width_ns", settings.widths)):
+            summary[name] = dict(start=axis.start, end=axis.stop - 1, step=axis.step)
+        conditions = product(settings.frequencies, settings.widths)
+    else:
+        summary.update(mode="file", source_file=str(source_file))
+        conditions = (None,)
     try:
         settings.destination.mkdir(parents=True, exist_ok=True)
         directory = Path(mkdtemp(dir=settings.destination, prefix=now.strftime("%Y%m%d_%H%M%S_")))
         write_summary(directory, summary)
         on_started(directory)
         rng = np.random.default_rng()
-        for index, (frequency, width) in enumerate(product(settings.frequencies, settings.widths), 1):
+        for index, point in enumerate(conditions, 1):
             if cancelled.wait(interval_s if index > 1 else 0):
                 status = "stopped"
                 break
-            condition = (frequency, width)
-            time_s, voltage_v = simulate_capture(frequency, width, int(rng.integers(2**32)))
-            record = prepare_timed_waveform(time_s, voltage_v, point=condition)
+            condition = point
+            if source_file is None:
+                frequency, width = condition
+                time_s, voltage_v = simulate_capture(frequency, width, int(rng.integers(2**32)))
+                record = prepare_timed_waveform(time_s, voltage_v, point=condition)
+                filename = f"{index:04d}_{frequency}kHz_{width}ns.npz"
+                source_fields = dict(frequency_khz=frequency, width_ns=width)
+            else:
+                frequency = width = None
+                time_s, voltage_v, interval = load_waveform(source_file)
+                record = prepare_timed_waveform(time_s, voltage_v, sample_interval_s=interval,
+                                                path=source_file)
+                filename = "0001_导入波形.npz"
+                source_fields = dict(source_file=str(source_file))
             report = evaluate_shape_record(record, **settings.thresholds)
             if cancelled.is_set():
                 status = "stopped"
                 break
             pulse = next(pulse for pulse in record.pulses
                          if pulse["number"] == report["shape"]["representative_pulse"])
-            path = directory / f"{index:04d}_{frequency}kHz_{width}ns.npz"
+            path = directory / filename
             report_json = json.dumps(report, ensure_ascii=False, allow_nan=False)
             atomic_write(path, lambda stream: np.savez_compressed(
                 stream, time_s=time_s, voltage_v=voltage_v, evaluation_json=report_json))
-            measurement = Measurement(index, frequency, width, path, report, pulse)
-            entries.append(dict(frequency_khz=frequency, width_ns=width, capture=path.name,
+            measurement = Measurement(index, frequency, width, path, report, pulse, source_file)
+            entries.append(dict(**source_fields, capture=path.name,
                                 verdict=measurement.verdict, passed=report["passed"],
                                 alignment_pct=report["shape"]["score_pct"],
                                 raw_flatness_pct=report["flatness"]["raw_max_pct"]))
