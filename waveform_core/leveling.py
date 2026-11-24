@@ -9,7 +9,9 @@ from numbers import Integral
 import numpy as np
 
 from .capture_sampling import shared_sample_interval_ns
+from .hold_raw_band import classify_raw_band
 from .operating_timing import frequency_check
+from .reference_alignment import ALIGNMENT_TOLERANCE_EPS
 
 
 AXES = ("y0", "y1", "y2")
@@ -51,9 +53,15 @@ def measurement(record, report, shape):
         if values is not None and len(values) != scan_count:
             raise ValueError("边界扫描分数与窗口数目不一致。")
         scans[key] = [float(v) for v in values] if values and all(v is not None and isfinite(v) for v in values) else None
+    thresholds = report.get("thresholds")
+    geometry_valid = shape.get("geometry_valid", True)
+    if thresholds is not None:
+        scans["alignment"] = [score] if score is not None and geometry_valid else None
     return dict(path=str(record.path), fingerprint=record.waveform_fingerprint,
                 voltage_fingerprint=(record.measurement_context or {}).get("voltage_fingerprint"), raw_pct=raw,
                 raw_passed=bool(flat["raw_passed"]), raw_band=flat["raw_window_band"]["status"],
+                raw_bounds=flat["raw_window_band"], thresholds=thresholds, passed=report.get("passed"),
+                geometry_valid=geometry_valid,
                 rms_pct=rms, worst_rms_pct=float(flat["rms_max_pct"]),
                 shape_score_pct=score, shape_status=shape["status"], scans=scans,
                 interval_ns=interval, width_ns=width, width_mad_ns=float(np.median(np.abs(widths-width))),
@@ -102,6 +110,8 @@ class LevelingSession:
         self.pending_move = None
         self.limit_blocks = []
         self.status = "new"
+        self.thresholds = None
+        self.threshold_changes = []
         self.message = ""
         self.trials = 0
         self._seen = set()
@@ -121,6 +131,7 @@ class LevelingSession:
                              pending_offsets=list(capture_offsets) if capture_offsets is not None else None,
                              best=self.best, history=self.history,
                              limit_blocks=self.limit_blocks,
+                             thresholds=self.thresholds, threshold_changes=self.threshold_changes,
                              responses=self.responses, trials=self.trials, max_trials=self.max_trials,
                              max_repeats=self.max_repeats, window=self.window))
 
@@ -133,13 +144,38 @@ class LevelingSession:
         self._seen.add(obs["fingerprint"])
         if obs["voltage_fingerprint"] is not None:
             self._seen_voltages.add(obs["voltage_fingerprint"])
-        # Keep the best individual measured capture, even if later repeats disagree.
-        if obs["coverage"] == "early_loss_while_peers_hold" or obs["geometry_recovered"]:
-            return
+        self._update_best()
+
+    def _classification(self, obs):
+        if self.thresholds is None:
+            return obs["raw_passed"], obs["raw_band"], obs["shape_status"] == "flat"
+        limit = self.thresholds["raw_limit_pct"]
+        raw = [value for value in (obs["scans"].get("raw_by_window_pct") or ()) if value is not None]
+        raw_passed = obs["raw_pct"] < limit
+        observed_pass = raw_passed or any(value < limit for value in raw)
+        flip = observed_pass and (not raw_passed or any(value >= limit for value in raw))
+        bounds = obs["raw_bounds"]
+        status = classify_raw_band(bounds["bounds_pct"], flip, observed_pass=observed_pass,
+                                   lower_bound_exact=bounds.get("lower_bound_exact", False),
+                                   limit_pct=limit)["status"]
+        score = obs["shape_score_pct"]
+        aligned = (obs["geometry_valid"] and score is not None
+                   and score <= self.thresholds["alignment_tolerance_pct"] + ALIGNMENT_TOLERANCE_EPS)
+        return raw_passed, status, aligned
+
+    def _update_best(self):
         def rank(item):
-            return (not item["raw_passed"], item["shape_status"] != "flat", item["worst_rms_pct"], item["rms_pct"])
-        if self.best is None or rank(obs) < rank(self.best):
-            self.best = obs
+            raw_passed, _, aligned = self._classification(item)
+            if self.thresholds is not None:
+                score = item["shape_score_pct"]
+                return (not (raw_passed and aligned), score if score is not None else float("inf"),
+                        item["raw_pct"], item["worst_rms_pct"])
+            return (not raw_passed, not aligned, item["worst_rms_pct"], item["rms_pct"])
+
+        eligible = (item for item in self.history
+                    if (item["coverage"] != "early_loss_while_peers_hold"
+                        and not item["geometry_recovered"] and item["geometry_valid"]))
+        self.best = min(eligible, key=rank, default=None)
 
     def start(self, record, report, shape=None):
         if self.window is not None:
@@ -147,18 +183,40 @@ class LevelingSession:
         shape = shape or report["shape"]
         obs = measurement(record, report, shape)
         self.window = deepcopy(report["window"])
+        self.thresholds = deepcopy(obs["thresholds"])
         self._record(obs, action("start"))
         self._choose(shape)
         self._log_decision()
         return self.snapshot()
 
+    def _check_window(self, window):
+        for key in ("phase", "sensitivity_available", "sensitivity_phase_bands", "sensitivity_windows",
+                    "reference_fingerprint", "reference_operating_point", "alignment_windows"):
+            if not np.array_equal(window.get(key), self.window.get(key)):
+                raise ValueError("本轮参考保持期已经锁定。请在同一窗口下复评。")
+
+    def reassess(self, record, report):
+        """Apply new limits to the latest capture without accepting it a second time."""
+        if not self.history or self.pending_move or self._probe:
+            raise ValueError("请完成这一步的采集或回退后再调整阈值。")
+        self._check_window(report["window"])
+        obs = measurement(record, report, report["shape"])
+        if obs["fingerprint"] != self.history[-1]["fingerprint"] or obs["thresholds"] is None:
+            raise ValueError("请对本轮最新采集重新判定。")
+        if self.thresholds != obs["thresholds"]:
+            self.threshold_changes.append(dict(fingerprint=obs["fingerprint"], thresholds=obs["thresholds"],
+                                               passed=obs["passed"]))
+            self.thresholds = deepcopy(obs["thresholds"])
+            self._update_best()
+            self._choose(report["shape"], "已按新阈值判定当前波形。")
+        return self.snapshot()
+
     def _check_context(self, obs, window):
         if obs["fingerprint"] in self._seen or obs["voltage_fingerprint"] in self._seen_voltages:
             raise ValueError("这份波形已用于本轮。请选择本次新采集的文件。")
-        for key in ("phase", "sensitivity_available", "sensitivity_phase_bands", "sensitivity_windows",
-                    "reference_fingerprint", "reference_operating_point"):
-            if not np.array_equal(window.get(key), self.window.get(key)):
-                raise ValueError("本轮参考保持期已经锁定。请在同一窗口下复评。")
+        self._check_window(window)
+        if obs["thresholds"] != self.thresholds:
+            raise ValueError("本轮阈值已锁定，请按当前应用的阈值复评。")
         ref = self.history[0]
         if shared_sample_interval_ns([ref["interval_ns"], obs["interval_ns"]]) is None:
             raise ValueError("本次采样间隔与基准不同，请用同一采集设置复采。")
@@ -214,7 +272,11 @@ class LevelingSession:
     def _choose(self, shape, prefix=""):
         self.limit_blocks = []
         if shape["status"] == "flat":
-            self._set("flat", prefix+"保持三个 y，本轮结束。")
+            if self.thresholds is not None and not self._classification(self.history[-1])[0]:
+                self._set("aligned", prefix+"红蓝已对齐，整段不平度超限。保持三个 y，检查区内和框间波形。")
+            else:
+                message = "两项达标，保持三个 y，本轮结束。" if self.thresholds else "保持三个 y，本轮结束。"
+                self._set("flat", prefix+message)
             return
         if self.trials >= self.max_trials:
             self._set("budget", prefix+"达到本轮试调次数上限，已记录本轮最佳观测。")
@@ -271,26 +333,32 @@ class LevelingSession:
                         from_offsets=before[-1]["offsets"], to_offsets=list(self.offsets),
                         before_files=[o["fingerprint"] for o in before],
                         after_files=[o["fingerprint"] for o in after], region_delta_pct={})
-        evidence.update(self._matched_comparison(before, after, "rms_by_window_pct"))
+        evidence["rms"] = self._matched_comparison(before, after, "rms_by_window_pct")
+        evidence.update(self._matched_comparison(before, after, "alignment") if self.thresholds
+                        else evidence["rms"])
         evidence["worst_rms"] = self._matched_comparison(before, after, "worst_rms_by_window_pct")
         evidence["raw"] = self._matched_comparison(before, after, "raw_by_window_pct")
         for axis in AXES:
             a = [o["errors_pct"].get(axis) for o in before]
             b = [o["errors_pct"].get(axis) for o in after]
             evidence["region_delta_pct"][axis] = (None if None in a+b else float(np.median(b)-np.median(a)))
-        if any(o["coverage"] == "early_loss_while_peers_hold" or o["geometry_recovered"] for o in checks):
+        before_checks = [self._classification(o) for o in before]
+        after_checks = [self._classification(o) for o in after]
+        if any(o["coverage"] == "early_loss_while_peers_hold" or o["geometry_recovered"]
+               or not o["geometry_valid"] for o in checks):
             verdict = "shape_review"
-        elif (all(o["raw_band"] == "all_below_limit" for o in before)
-              and all(o["raw_band"] == "all_above_limit" for o in after)):
+        elif (all(band == "all_below_limit" for _, band, _ in before_checks)
+              and all(band == "all_above_limit" for _, band, _ in after_checks)):
             verdict = "worse"
-        elif (any(o["raw_passed"] or o["raw_band"] == "boundary_sensitive" for o in before)
-              and any(not o["raw_passed"] or o["raw_band"] == "boundary_sensitive" for o in after)):
+        elif (any(passed or band == "boundary_sensitive" for passed, band, _ in before_checks)
+              and any(not passed or band == "boundary_sensitive" for passed, band, _ in after_checks)):
             verdict = "repeat"
-        elif all(o["shape_status"] == "flat" for o in after):
+        elif all(aligned for _, _, aligned in after_checks):
             # A new capture at the shape target stops tuning even if the
             # existing strict power limit is still unmet.
             verdict = "shape_target"
-        elif not self.window.get("sensitivity_available") or evidence["gain_range_pp"] is None:
+        elif ((self.thresholds is None and not self.window.get("sensitivity_available"))
+              or evidence["gain_range_pp"] is None):
             verdict = "boundary_review"
         else:
             lo, hi = evidence["gain_range_pp"]
@@ -298,7 +366,7 @@ class LevelingSession:
             if noise is not None and lo > noise+EPS:
                 # A median improvement can conceal an obvious bad pulse.
                 guard_metrics = [evidence["worst_rms"]]
-                if any(not obs["raw_passed"] for obs in after):
+                if any(not passed for passed, _, _ in after_checks):
                     guard_metrics.append(evidence["raw"])
                 regressed = any(metric["noise_pp"] is not None
                                 and metric["gain_range_pp"][1] < -metric["noise_pp"]-EPS
@@ -352,7 +420,8 @@ class LevelingSession:
             elif verdict == "better":
                 self.responses.append(response)
                 self._probe = None
-                self._choose(shape, "同窗 RMS 改善超过本轮复采波动，保留这一步。")
+                metric = "红蓝偏差" if self.thresholds else "同窗 RMS"
+                self._choose(shape, f"{metric}改善超过本轮复采波动，保留这一步。")
             elif verdict in ("worse", "pulse_regression") or self._repeats >= self.max_repeats:
                 self.responses.append(response)
                 probe = self._probe["move"]

@@ -13,11 +13,13 @@ import numpy as np
 
 from fiber1100_algorithm import evaluate_shape_record
 from waveform_core.leveling import LevelingSession
+from waveform_core.reference_alignment import DEFAULT_ALIGNMENT_TOLERANCE_PCT
 from waveform_core.timing_pulses import prepare_timed_file
 
 
 AXES = ("y0", "y1", "y2")
 LABELS = {"y0": "肩部", "y1": "平顶前段", "y2": "平顶中段"}
+DEFAULT_THRESHOLDS = {"alignment_tolerance_pct": DEFAULT_ALIGNMENT_TOLERANCE_PCT, "raw_limit_pct": 15.0}
 
 
 class WaveformApp:
@@ -28,9 +30,10 @@ class WaveformApp:
         self.pending = Queue()
         self.loading_mode = None
         self.busy = False
+        self.thresholds = DEFAULT_THRESHOLDS.copy()
         root.title("方波评价")
-        root.geometry("990x720")
-        root.minsize(775, 600)
+        root.geometry("990x760")
+        root.minsize(775, 630)
         root.option_add("*Font", ("Microsoft YaHei UI", 10))
         style = ttk.Style(root)
         style.configure("Heading.TLabel", font=("Microsoft YaHei UI", 17, "bold"), foreground="#153947")
@@ -49,6 +52,22 @@ class WaveformApp:
             button.pack(side="right", padx=(8, 0))
         self.filename = ttk.Label(page, text="打开示波器 CSV 或 NPZ 波形开始。", style="Hint.TLabel")
         self.filename.pack(fill="x", pady=(3, 8))
+
+        threshold_bar = ttk.Frame(page)
+        threshold_bar.pack(fill="x", pady=(0, 9))
+        self.threshold_inputs = {}
+        self.threshold_entries = []
+        for key, label in (("alignment_tolerance_pct", "红蓝高度允许偏差 (%)"),
+                           ("raw_limit_pct", "保持期不平度上限 (%)")):
+            ttk.Label(threshold_bar, text=label).pack(side="left")
+            variable = tk.StringVar(value=f"{self.thresholds[key]:g}")
+            entry = ttk.Entry(threshold_bar, textvariable=variable, width=7)
+            entry.pack(side="left", padx=(5, 14))
+            entry.bind("<Return>", lambda _event: self.apply_thresholds())
+            self.threshold_inputs[key] = variable
+            self.threshold_entries.append(entry)
+        self.threshold_button = ttk.Button(threshold_bar, text="应用阈值", command=self.apply_thresholds)
+        self.threshold_button.pack(side="left")
 
         self.summary = ttk.Label(page, text="", style="Summary.TLabel")
         self.summary.pack(fill="x")
@@ -116,10 +135,39 @@ class WaveformApp:
             self.save_button: self.result is not None,
             self.auto_button: not awaiting and self.report is not None and self.report["window"]["confirmed"],
             self.worst_button: self.report is not None and len(self.record.pulses) > 1,
+            self.threshold_button: not self.thresholds_locked(),
         }
         for widget, enabled in buttons.items():
             widget.configure(state="normal" if enabled and not self.busy else "disabled")
         self.pulse.configure(state="readonly" if self.record and self.record.pulses and not self.busy else "disabled")
+        for entry in self.threshold_entries:
+            entry.configure(state="disabled" if self.busy or self.thresholds_locked() else "normal")
+
+    def thresholds_locked(self):
+        result = self.result or {}
+        action = result.get("next_action")
+        return bool(result.get("pending_move") or
+                    (action and action["kind"] in ("capture", "repeat", "rollback")))
+
+    def apply_thresholds(self):
+        if self.busy or self.thresholds_locked():
+            return
+        try:
+            values = {key: float(variable.get()) for key, variable in self.threshold_inputs.items()}
+            if (not all(np.isfinite(value) for value in values.values())
+                    or values["alignment_tolerance_pct"] < 0 or values["raw_limit_pct"] <= 0):
+                raise ValueError
+        except ValueError:
+            self.notice.configure(text="红蓝允许偏差须为非负数，不平度上限须为正数。请输入百分比数值。")
+            return
+        if values == self.thresholds:
+            self.notice.configure(text="当前已使用这组阈值。")
+            return
+        if self.report is None:
+            self.thresholds = values
+            self.notice.configure(text="已应用阈值，打开波形后按这组阈值判定。")
+            return
+        self.open_path(self.path, mode="thresholds", thresholds=values)
 
     def choose(self, mode):
         if self.busy:
@@ -137,7 +185,7 @@ class WaveformApp:
         if path:
             self.open_path(path, mode=mode)
 
-    def open_path(self, path, *, mode="start", phase=None):
+    def open_path(self, path, *, mode="start", phase=None, thresholds=None):
         if self.busy:
             return
         if mode in ("applied", "repeat") and not (self.result or {}).get("next_action"):
@@ -147,21 +195,25 @@ class WaveformApp:
         self.notice.configure(text="正在评价波形…")
         self.refresh_controls()
         path = Path(path).resolve()
-        Thread(target=self.work, args=(path, mode, phase), daemon=True).start()
+        values = self.thresholds.copy() if thresholds is None else thresholds
+        Thread(target=self.work, args=(path, mode, phase, values), daemon=True).start()
         self.root.after(50, self.finish)
 
-    def work(self, path, mode, phase):
+    def work(self, path, mode, phase, thresholds):
         record = report = None
         try:
-            record = prepare_timed_file(path)
+            record = self.record if mode == "thresholds" else prepare_timed_file(path)
             if mode == "start":
                 session = LevelingSession()
-                report = evaluate_shape_record(record, confirmed_phase=phase)
+                report = evaluate_shape_record(record, confirmed_phase=phase, **thresholds)
                 result = session.start(record, report)
             else:
                 session = self.session
-                report = evaluate_shape_record(record, window=session.window)
-                result = session.observe(record, report, applied=mode == "applied")
+                report = evaluate_shape_record(record, window=session.window, **thresholds)
+                if mode == "thresholds":
+                    result = session.reassess(record, report)
+                else:
+                    result = session.observe(record, report, applied=mode == "applied")
             self.pending.put((path, record, report, session, result, None))
         except Exception as error:
             self.pending.put((path, record, None, None, None, str(error) or type(error).__name__))
@@ -174,7 +226,8 @@ class WaveformApp:
             return
         self.busy = False
         if error:
-            note = f"未接收 {path.name}。{error}"
+            note = (f"阈值未应用。{error}" if self.loading_mode == "thresholds"
+                    else f"未接收 {path.name}。{error}")
             if self.result and self.result.get("status") == "await_capture":
                 note += " 保持这一步的设置，重新载入本步新采集。"
             self.notice.configure(text=note)
@@ -193,8 +246,9 @@ class WaveformApp:
         else:
             self.path, self.record, self.report = path, record, report
             self.session, self.result = session, result
+            self.thresholds = report["thresholds"].copy()
             self.filename.configure(text=path.name)
-            self.notice.configure(text="")
+            self.notice.configure(text="已用新阈值重新判断当前波形。" if self.loading_mode == "thresholds" else "")
             self.set_pulses(report["shape"]["representative_pulse"])
             self.show_results()
             self.draw()
@@ -222,7 +276,8 @@ class WaveformApp:
         destination = Path(path)
         temporary = None
         try:
-            content = json.dumps({"window": self.session.window, "session": self.result},
+            content = json.dumps({"window": self.session.window, "thresholds": self.report["thresholds"],
+                                  "evaluation": self.report, "session": self.result},
                                  ensure_ascii=False, indent=2, allow_nan=False)
             if destination.resolve() == self.path or destination.suffix.lower() != ".json":
                 raise ValueError("请选择 JSON 结果文件。")
@@ -250,28 +305,34 @@ class WaveformApp:
     def show_results(self):
         score = self.report["flatness"]
         shape = self.report["shape"]
+        align_limit = self.thresholds["alignment_tolerance_pct"]
+        raw_limit = self.thresholds["raw_limit_pct"]
         n = len(score["pulses"])
         bad = sum(not row["raw_passed"] for row in score["pulses"])
-        verdict = "全部低于 15%" if bad == 0 else f"{bad}/{n} 个脉冲达到或超过 15%"
-        self.summary.configure(text=f"最大不平度 {score['raw_max_pct']:.2f}%  ·  {verdict}"
-                                    f"    RMS 中位数 {score['rms_median_pct']:.2f}%")
-        shape_note = shape["reason"]
+        align_score = shape["score_pct"]
+        alignment = "红蓝高度待复核" if align_score is None else f"红蓝最大偏差 {align_score:.2f}%（允许 ±{align_limit:g}%）"
+        verdict = "达标" if self.report["passed"] else "未达标"
+        self.summary.configure(text=f"{verdict}    {alignment}\n"
+                                    f"最大不平度 {score['raw_max_pct']:.2f}%（要求 <{raw_limit:g}%）")
+        shape_note = f"{bad}/{n} 个脉冲不平度超限。" if bad else "全部脉冲不平度达标。"
+        if shape["status"] == "flat" and bad:
+            shape_note += " 三个红框已对齐，检查框内尖峰或框间凹陷。"
         if shape["status"] == "trial":
-            shape_note = f"{len(shape['shape_failed_pulses'])}/{n} 个脉冲超出暂定形状范围。"
+            shape_note += f" {len(shape['shape_failed_pulses'])}/{n} 个脉冲红蓝偏差超限。"
         if score["raw_window_band"]["status"] == "boundary_sensitive":
-            shape_note += "  保持期边界变化会影响 15% 判定。"
+            shape_note += f" 窗口边界变化会影响 {raw_limit:g}% 判定。"
         self.shape_note.configure(text=shape_note)
         action = self.result.get("next_action")
         for axis, label in zip(AXES, self.direction_labels, strict=True):
             row = shape["regions"].get(axis, {})
             error = row.get("error_pct")
-            level = "" if error is None else f"    区域偏差 {error:+.2f}%"
+            level = "" if error is None else f"    相对蓝框 {error:+.2f}%"
             movement = "本步保持" if action else "保持"
             if action and action["axis"] == axis and action["step"]:
                 movement = f"{'回退' if action['kind'] == 'rollback' else '试调'} {action['step']:+d}"
             elif self.result.get("pending_move") and self.result["pending_move"]["axis"] == axis:
                 movement = f"已调 {self.result['pending_move']['step']:+d}，待复评"
-            elif action is None and self.result["status"] != "flat":
+            elif action is None and self.result["status"] not in ("flat", "aligned"):
                 movement = "暂缓"
             label.configure(text=f"{axis} · {LABELS[axis]}    {movement}{level}")
         self.status.configure(text=self.result["message"])
@@ -304,21 +365,33 @@ class WaveformApp:
         x0 = left - xmin * xscale
         self.plot_transform = x0, xscale, w50, top, bottom
         if self.report:
-            a, b = self.report["window"]["phase"]
+            window = self.report["window"]
+            a, b = window["phase"]
             xa, xb = x0 + a * w50 * xscale, x0 + b * w50 * xscale
-            self.canvas.create_rectangle(xa, top, xb, bottom, outline="#458c87", fill="#e0f1ee")
-            source = "手动窗" if self.report["window"]["confirmed"] else "自动窗"
-            self.window_hint.configure(text=f"{source} {a*w50:.2f}–{b*w50:.2f} ns · 拖动改窗将重开本轮")
+            self.canvas.create_rectangle(xa, top, xb, bottom, outline="#699490", fill="#f1f6f5")
+            source = "手动窗" if window["confirmed"] else "自动窗"
+            self.window_hint.configure(text=f"{source} {a*w50:.2f}–{b*w50:.2f} ns · 拖动修改")
             action = self.result.get("next_action")
-            if action and action["kind"] == "trial":
-                region = self.report["shape"]["regions"][action["axis"]].get("phase_window")
-                if region:
-                    first, last = region
-                    rx = x0 + first * w50 * xscale
-                    ex = x0 + last * w50 * xscale
-                    self.canvas.create_rectangle(rx, top, ex, bottom, fill="#ffedd0", outline="#b88039")
-                    self.canvas.create_text((rx + ex) / 2, top + 8, text=action["axis"], fill="#754918")
-
+            active_axis = action["axis"] if action and action["kind"] == "trial" else None
+            for axis, region in window["alignment_windows"].items():
+                if region is None:
+                    continue
+                start, end = region
+                if axis == "reference":
+                    text, fill, outline = "参考", "#dceefb", "#246c9a"
+                elif axis == active_axis:
+                    text, fill, outline = axis, "#ffd9d5", "#9d3531"
+                else:
+                    text, fill, outline = axis, "#fae9e7", "#b46761"
+                rx, ex = x0 + start * w50 * xscale, x0 + end * w50 * xscale
+                self.canvas.create_rectangle(rx, top, ex, bottom, fill=fill, outline=outline,
+                                             width=2 if axis == active_axis else 1)
+                self.canvas.create_text((rx + ex) / 2, top + 8, text=text, fill=outline)
+            observed = self.report["shape"]["pulse_regions"].get(pulse["number"], {})
+            reference = observed.get("reference_level_v")
+            if reference is not None:
+                y = bottom - 6 - (reference + pulse["baseline_v"] - ymin) * yscale
+                self.canvas.create_line(xa, y, xb, y, fill="#246c9a", dash=(5, 4))
         else:
             self.window_hint.configure(text="拖动曲线区域手动框选保持期")
         for fraction in (0., .25, .5, .75, 1.):

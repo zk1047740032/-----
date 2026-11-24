@@ -43,7 +43,7 @@ def pulse_range_in_band(pulse, bands):
     return lo,hi
 
 
-def raw_band_report(pulses, bands, sampled_flip, *, observed_pass=False):
+def raw_band_report(pulses, bands, sampled_flip, *, observed_pass=False, limit_pct=15.):
     report = dict(status='insufficient_band', bounds_pct=None)
     if not pulses or bands is None:
         return report
@@ -53,17 +53,24 @@ def raw_band_report(pulses, bands, sampled_flip, *, observed_pass=False):
     low,high = np.max(values,axis=0)
     # max(min(pulse)) bounds the worst-pulse score from below. The upper bound
     # max(max(pulse)) is attained even though all pulses share the same phase.
-    # Separate near-limit rounding of accumulated sums from the strict nominal
-    # check using its directly computed mean.
+    return classify_raw_band((low, high), sampled_flip, observed_pass=observed_pass,
+                             lower_bound_exact=len(pulses)==1, limit_pct=limit_pct)
+
+
+def classify_raw_band(bounds, sampled_flip, *, observed_pass, lower_bound_exact, limit_pct):
+    if bounds is None:
+        return dict(status='insufficient_band', bounds_pct=None)
+    low, high = bounds
+    # Round-off in prefix sums is separate from the strict nominal check.
     tol = 1e-9
-    proven_pass = observed_pass or (len(pulses)==1 and low<15.-tol)
-    if sampled_flip or (proven_pass and high>15.+tol):
+    proven_pass = observed_pass or (lower_bound_exact and low<limit_pct-tol)
+    if sampled_flip or (proven_pass and high>limit_pct+tol):
         status = 'boundary_sensitive'
-    elif high<15.-tol:
+    elif high<limit_pct-tol:
         status = 'all_below_limit'
-    elif low>15.+tol:
+    elif low>limit_pct+tol:
         status = 'all_above_limit'
     else:
         status = 'unresolved_within_band'
     return dict(status=status, bounds_pct=[float(low),float(high)],
-                lower_bound_exact=len(pulses)==1)
+                lower_bound_exact=lower_bound_exact)

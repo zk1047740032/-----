@@ -19,6 +19,7 @@ from waveform_core.direction_band import check_direction_band
 from waveform_core.operating_timing import assert_frequency_consistent
 from waveform_core.pulse_coverage import check_pulse_coverage
 from waveform_core.capture_sampling import pulse_sample_intervals_ns, shared_sample_interval_ns
+from waveform_core.reference_alignment import DEFAULT_ALIGNMENT_TOLERANCE_PCT, adjust_reference_window, assess_alignment
 
 
 # The nominal values reproduce the six reviewed windows on their labeled pulses.
@@ -113,7 +114,7 @@ def coherent_hold_profile(signal, sample_interval_ns, mean_v):
     return 100.*(averages-mean_v)/mean_v, count
 
 
-def score_locked(record, window):
+def score_locked(record, window, *, raw_limit_pct=15.):
     """Keep all raw hold samples and report coherent local deviations as diagnostics."""
     results = []
     rms_by_window = []
@@ -145,19 +146,21 @@ def score_locked(record, window):
         row['local_low_ns'] = float(centers[low])
         row['local_average_ns'] = count*dt
         row['coherent_rms_pct'] = float(np.sqrt(np.mean(profile**2)))
-        row['raw_passed'] = row['raw_pp_pct'] < 15.
+        row['raw_passed'] = row['raw_pp_pct'] < raw_limit_pct
         row['geometry_recovered'] = pulse.get('geometry_recovered', False)
     score_range = [s['rms_median'] for s in results]
     raw_range = [s['raw_pp_max'] for s in results]
     coherent = [s['coherent_rms_pct'] for s in selected['scores']]
-    raw_limit_sensitive = min(raw_range) < 15. <= max(raw_range)
+    observed_pass = min(raw_range) < raw_limit_pct
+    raw_limit_sensitive = observed_pass and max(raw_range) >= raw_limit_pct
     band = window.get('sensitivity_phase_bands') if window.get('sensitivity_available') else None
     bounds = raw_band_report(record.pulses, band, raw_limit_sensitive,
-                             observed_pass=min(raw_range)<15.)
+                             observed_pass=observed_pass, limit_pct=raw_limit_pct)
     return dict(pulses=selected['scores'], rms_median_pct=selected['rms_median'],
                 rms_max_pct=selected['rms_max'], rms_window_range_pct=[min(score_range), max(score_range)],
                 coherent_rms_median_pct=float(np.median(coherent)), coherent_rms_max_pct=max(coherent),
-                raw_max_pct=selected['raw_pp_max'], raw_passed=selected['raw_pp_max'] < 15.,
+                raw_max_pct=selected['raw_pp_max'], raw_passed=selected['raw_pp_max'] < raw_limit_pct,
+                raw_limit_pct=raw_limit_pct,
                 raw_window_range_pct=[min(raw_range), max(raw_range)],
                 raw_limit_sensitive=raw_limit_sensitive, raw_window_band=bounds,
                 sensitivity_scores=len(results), rms_by_window_pct=rms_by_window,
@@ -308,33 +311,55 @@ def evaluate_record(record, *, window=None, confirmed_phase=None, point=None, pa
     return result
 
 
-def evaluate_shape_record(record, *, window=None, confirmed_phase=None):
+def evaluate_shape_record(record, *, window=None, confirmed_phase=None,
+                          alignment_tolerance_pct=None, raw_limit_pct=15.):
     """Evaluate one capture from its samples, optionally on the session's locked window."""
     from waveform_core.shape_feedback import assess_shape
+
+    if not np.isfinite(raw_limit_pct) or raw_limit_pct <= 0:
+        raise ValueError('不平度上限须为大于 0 的有限百分比')
+    if alignment_tolerance_pct is None and window is not None and 'alignment_windows' in window:
+        alignment_tolerance_pct = DEFAULT_ALIGNMENT_TOLERANCE_PCT
+    aligned_mode = alignment_tolerance_pct is not None
+    if aligned_mode:
+        if not np.isfinite(alignment_tolerance_pct) or alignment_tolerance_pct < 0:
+            raise ValueError('红蓝允许偏差须为非负的有限百分比')
 
     if window is not None and confirmed_phase is not None:
         raise ValueError('锁定的比较窗和新框选的相位只能使用一项')
     if window is None:
         window = window_from_reference(record, confirmed_phase, use_saved_context=False)
+        if aligned_mode:
+            window = adjust_reference_window(record, window, confirmed_phase=confirmed_phase)
+    elif aligned_mode and 'alignment_windows' not in window:
+        raise ValueError('请从起始波形建立含红蓝四区的参考窗')
     phase = validate_phase_window(window['phase'])
     if not window.get('sensitivity_windows') or not np.array_equal(phase, window['sensitivity_windows'][0]):
         raise ValueError('参考窗起止和首个评分窗口不一致')
-    report = dict(window=window, flatness=score_locked(record, window),
+    report = dict(window=window, flatness=score_locked(record, window, raw_limit_pct=raw_limit_pct),
                   timing_check=assert_frequency_consistent(record, window.get('reference_operating_point')))
-    report['shape'] = assess_shape(record, report)
+    if aligned_mode:
+        report['shape'] = assess_alignment(record, report, tolerance_pct=alignment_tolerance_pct)
+        report['thresholds'] = dict(alignment_tolerance_pct=float(alignment_tolerance_pct),
+                                    raw_limit_pct=float(raw_limit_pct))
+        report['passed'] = report['shape']['status'] == 'flat' and report['flatness']['raw_passed']
+    else:
+        report['shape'] = assess_shape(record, report)
     return report
 
 
 def evaluate_waveform(time_s, voltage_v, **options):
     """Numerical entry for one record. Arrays use seconds and volts."""
     record = prepare_timed_waveform(time_s, voltage_v, point=options.get('point'))
-    if not (options.keys() - {'window', 'confirmed_phase'}):
+    shape_options = {'window', 'confirmed_phase', 'alignment_tolerance_pct', 'raw_limit_pct'}
+    if not (options.keys() - shape_options):
         return evaluate_shape_record(record, **options)
     return evaluate_record(record, **options)
 
 
 def run_leveling(capture, apply_step, *, initial_y, bounds, confirmed_phase=None,
-                 max_trials=12, max_repeats=2, cancelled=None):
+                 max_trials=12, max_repeats=2, cancelled=None,
+                 alignment_tolerance_pct=None, raw_limit_pct=15.):
     """Drive the same feedback loop through acquisition and board callbacks.
 
     capture() saves fresh data to a CSV/NPZ and returns its path. apply_step()
@@ -349,11 +374,12 @@ def run_leveling(capture, apply_step, *, initial_y, bounds, confirmed_phase=None
     session = LevelingSession(max_trials=max_trials, max_repeats=max_repeats, initial_y=initial_y, bounds=limits)
     action = None
     phase = "初始采集"
+    criteria = dict(alignment_tolerance_pct=alignment_tolerance_pct, raw_limit_pct=raw_limit_pct)
     try:
         if cancelled is not None and cancelled():
             return dict(session.snapshot(), status="stopped", message="在初始采集前停止。")
         record = prepare_timed_file(capture())
-        report = evaluate_shape_record(record, confirmed_phase=confirmed_phase)
+        report = evaluate_shape_record(record, confirmed_phase=confirmed_phase, **criteria)
         state = session.start(record, report)
         while state["next_action"] is not None:
             phase = "等待下一步"
@@ -367,7 +393,7 @@ def run_leveling(capture, apply_step, *, initial_y, bounds, confirmed_phase=None
                 session.mark_applied()
             phase = "调整后采集" if session.pending_move else "同设置复采"
             record = prepare_timed_file(capture())
-            report = evaluate_shape_record(record, window=session.window)
+            report = evaluate_shape_record(record, window=session.window, **criteria)
             state = session.observe(record, report, applied=session.pending_move is not None)
         return state
     except Exception as error:
@@ -389,6 +415,8 @@ def main():
     parser.add_argument('--paired-calibration', type=Path, help='Optional saved ordered-step evidence')
     parser.add_argument('--before', type=Path, help='Optional waveform recorded immediately before a one-axis trial')
     parser.add_argument('--before-y', nargs=3, type=float)
+    parser.add_argument('--alignment-tolerance', type=float, help='Use four-region alignment with this tolerance in percent')
+    parser.add_argument('--raw-limit', type=float, default=15., help='Strict raw nonuniformity limit in percent')
     parser.add_argument('--output', type=Path, help='Save the result to a new JSON file')
     args = parser.parse_args()
     if args.window_json and args.phase:
@@ -399,6 +427,8 @@ def main():
         parser.error('--before-y requires --before')
     calibrated = any(value is not None for value in
                      (args.point, args.y, args.before, args.paired_calibration))
+    if calibrated and (args.alignment_tolerance is not None or args.raw_limit != 15.):
+        parser.error('可调阈值用于波形评价入口，请省略工况、y 值及标定参数')
     record = prepare_timed_file(args.waveform, point=args.point)
     margin = None
     if args.window_json:
@@ -419,12 +449,15 @@ def main():
         baseline = prepare_timed_file(args.reference, point=args.point) if args.reference else record
         window = window_from_reference(baseline, args.phase, operating_point=args.point,
                                        use_saved_context=calibrated)
+        if args.alignment_tolerance is not None:
+            window = adjust_reference_window(baseline, window, confirmed_phase=args.phase)
     paired = json.loads(args.paired_calibration.read_text(encoding='utf-8')) if args.paired_calibration else None
     if calibrated:
         report = evaluate_record(record, window=window, point=args.point, parameters=args.y,
                                  repeat_margin_pp=margin, paired_calibration=paired)
     else:
-        report = evaluate_shape_record(record, window=window)
+        report = evaluate_shape_record(record, window=window, alignment_tolerance_pct=args.alignment_tolerance,
+                                       raw_limit_pct=args.raw_limit)
     if args.before:
         before = prepare_timed_file(args.before, point=args.point)
         report['trial_review'] = review_trial(before,record,window,point=args.point,
