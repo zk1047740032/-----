@@ -1,12 +1,12 @@
-import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from waveform_core.timing_pulses import prepare_timed_file, prepare_timed_waveform
+from waveform_core.timing_pulses import prepare_timed_waveform
 from waveform_simulation import (
     DEFAULT_FREQUENCY,
     DEFAULT_WIDTH,
@@ -19,16 +19,11 @@ from waveform_simulation import (
 )
 
 
-def settings_for(destination, **overrides):
+def settings_for(**overrides):
     values = dict(frequencies=scan_axis(*DEFAULT_FREQUENCY, "重频"),
-                  widths=scan_axis(*DEFAULT_WIDTH, "脉宽"), destination=Path(destination),
-                  scope_ip="192.168.7.12", board_port="COM42",
+                  widths=scan_axis(*DEFAULT_WIDTH, "脉宽"),
                   alignment_tolerance_pct=7.0, raw_limit_pct=20.0)
     return SimulationSettings(**(values | overrides))
-
-
-def summary_for(outcome):
-    return json.loads((outcome.directory / "run.json").read_text(encoding="utf-8"))
 
 
 class SimulationTests(unittest.TestCase):
@@ -55,86 +50,64 @@ class SimulationTests(unittest.TestCase):
         for args in ((0, 100, 20), (100, 80, 20), (80, 100, 0)):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 scan_axis(*args, "重频")
-        for fields in (dict(scope_ip="invalid"), dict(raw_limit_pct=0),
+        for fields in (dict(alignment_tolerance_pct=-1), dict(raw_limit_pct=0),
                        dict(frequencies=range(1, 2), widths=range(100, 101))):
             with self.subTest(fields=fields), self.assertRaises(ValueError):
-                settings_for(".", **fields)
+                settings_for(**fields)
         wide_pulse = range(5000, 5001)
         with self.assertRaisesRegex(ValueError, "周期"):
-            settings_for(".", frequencies=range(200, 201), widths=wide_pulse)
-        valid = settings_for(".", frequencies=range(150, 151), widths=wide_pulse)
+            settings_for(frequencies=range(200, 201), widths=wide_pulse)
+        valid = settings_for(frequencies=range(150, 151), widths=wide_pulse)
         self.assertEqual(valid.widths, wide_pulse)
 
-    def test_single_evaluates_and_saves_loadable_capture(self):
-        with TemporaryDirectory() as temporary:
-            settings = settings_for(temporary, frequencies=range(100, 101), widths=range(300, 301))
-            results, paths = [], []
-            outcome = run_simulation(settings, Event(), paths.append, results.append, interval_s=0)
-            self.assertEqual(outcome.status, "completed")
-            self.assertEqual(paths, [outcome.directory])
-            self.assertEqual(outcome.saved, 1)
-            measurement, = results
-            summary = summary_for(outcome)
-            self.assertEqual(summary["status"], "completed")
-            self.assertEqual(summary["thresholds"], settings.thresholds)
-            self.assertEqual(summary["scope_ip"], settings.scope_ip)
-            self.assertEqual(summary["board_port"], settings.board_port)
-            self.assertEqual(summary["measurements"][0]["capture"], measurement.capture_path.name)
-            record = prepare_timed_file(measurement.capture_path, point=(100, 300))
-            self.assertEqual(len(record.pulses), 3)
-            self.assertEqual(measurement.pulse["number"], measurement.report["shape"]["representative_pulse"])
-            with np.load(measurement.capture_path, allow_pickle=False) as data:
-                saved_report = json.loads(data["evaluation_json"].item())
-            self.assertEqual(saved_report["passed"], measurement.report["passed"])
-            self.assertEqual(saved_report["flatness"]["raw_max_pct"],
-                             measurement.report["flatness"]["raw_max_pct"])
+    def test_single_evaluation_publishes_measurement_without_writing(self):
+        settings = settings_for(frequencies=range(100, 101), widths=range(300, 301))
+        results = []
+        with patch("numpy.savez_compressed") as save_capture:
+            outcome = run_simulation(settings, Event(), results.append, interval_s=0)
+        save_capture.assert_not_called()
+        self.assertEqual((outcome.status, outcome.evaluated), ("completed", 1))
+        measurement, = results
+        self.assertEqual((measurement.frequency_khz, measurement.width_ns), (100, 300))
+        self.assertEqual(measurement.report["thresholds"], settings.thresholds)
+        self.assertEqual(len(measurement.report["flatness"]["pulses"]), 3)
+        self.assertEqual(measurement.pulse["number"], measurement.report["shape"]["representative_pulse"])
 
     def test_scan_steps_through_width_before_frequency_and_stops(self):
-        with TemporaryDirectory() as temporary:
-            settings = settings_for(temporary)
-            first_frequency, next_frequency = settings.frequencies[:2]
-            first_width = settings.widths[0]
-            expected = [(first_frequency, width) for width in settings.widths]
-            expected.append((next_frequency, first_width))
-            stop_after = len(expected)
-            cancelled = Event()
-            points = []
+        settings = settings_for()
+        first_frequency, next_frequency = settings.frequencies[:2]
+        first_width = settings.widths[0]
+        expected = [(first_frequency, width) for width in settings.widths]
+        expected.append((next_frequency, first_width))
+        stop_after = len(expected)
+        cancelled = Event()
+        points = []
 
-            def record_point(result):
-                points.append((result.frequency_khz, result.width_ns))
-                if len(points) == stop_after:
-                    cancelled.set()
+        def record_point(result):
+            points.append((result.frequency_khz, result.width_ns))
+            if len(points) == stop_after:
+                cancelled.set()
 
-            outcome = run_simulation(settings, cancelled, lambda _: None, record_point, interval_s=0)
-            self.assertEqual(settings.count, len(settings.frequencies) * len(settings.widths))
-            self.assertEqual(points, expected)
-            self.assertEqual((outcome.status, outcome.saved), ("stopped", stop_after))
-            self.assertEqual(summary_for(outcome)["status"], "stopped")
-            self.assertEqual(len(list(outcome.directory.glob("*.npz"))), stop_after)
-            restarted = settings_for(temporary, frequencies=range(first_frequency, first_frequency + 1),
-                                     widths=range(first_width, first_width + 1))
-            second = run_simulation(restarted, Event(), lambda _: None, lambda _: None, interval_s=0)
-            self.assertEqual((second.status, second.saved), ("completed", 1))
-            self.assertNotEqual(second.directory, outcome.directory)
+        outcome = run_simulation(settings, cancelled, record_point, interval_s=0)
+        self.assertEqual(settings.count, len(settings.frequencies) * len(settings.widths))
+        self.assertEqual(points, expected)
+        self.assertEqual((outcome.status, outcome.evaluated), ("stopped", stop_after))
+        restarted = settings_for(frequencies=range(first_frequency, first_frequency + 1),
+                                 widths=range(first_width, first_width + 1))
+        second = run_simulation(restarted, Event(), lambda _: None, interval_s=0)
+        self.assertEqual((second.status, second.evaluated), ("completed", 1))
 
-    def test_save_error_keeps_previous_measurements(self):
-        with TemporaryDirectory() as temporary:
-            settings = settings_for(temporary, frequencies=range(50, 51), widths=range(100, 201, 50))
-            failed_condition = (50, 150)
-            blocked_filename = "0002_50kHz_150ns.npz"
-
-            def block_second_capture(directory):
-                (directory / blocked_filename).mkdir()
-
-            results = []
-            outcome = run_simulation(settings, Event(), block_second_capture, results.append, interval_s=0)
-            self.assertEqual((outcome.status, outcome.saved, outcome.condition), ("failed", 1, failed_condition))
-            self.assertIn(blocked_filename, outcome.error)
-            self.assertEqual(len(results), 1)
-            self.assertTrue(results[0].capture_path.is_file())
-            summary = summary_for(outcome)
-            self.assertEqual(summary["failed_condition"], list(failed_condition))
-            self.assertEqual(len(summary["measurements"]), 1)
+    def test_evaluation_error_keeps_previous_measurements(self):
+        settings = settings_for(frequencies=range(50, 51), widths=range(100, 201, 50))
+        first_capture = simulate_capture(50, 100, seed=42)
+        results = []
+        with patch("waveform_simulation.simulate_capture",
+                   side_effect=[first_capture, ValueError("模拟采集失败")]):
+            outcome = run_simulation(settings, Event(), results.append, interval_s=0)
+        self.assertEqual((outcome.status, outcome.evaluated, outcome.condition), ("failed", 1, (50, 150)))
+        self.assertEqual(outcome.error, "模拟采集失败")
+        measurement, = results
+        self.assertEqual((measurement.frequency_khz, measurement.width_ns), (50, 100))
 
     def test_file_evaluation_uses_file_samples_and_current_thresholds(self):
         time_s, voltage_v = simulate_capture(190, 150, 12)
@@ -150,36 +123,30 @@ class SimulationTests(unittest.TestCase):
                 with self.subTest(source=source.name):
                     original = source.read_bytes()
                     results = []
-                    settings = FileEvaluationSettings(source, destination, thresholds)
-                    outcome = run_evaluation(settings, Event(), lambda _: None, results.append)
-                    self.assertEqual((outcome.status, outcome.saved), ("completed", 1))
+                    settings = FileEvaluationSettings(source, thresholds)
+                    outcome = run_evaluation(settings, Event(), results.append)
+                    self.assertEqual((outcome.status, outcome.evaluated), ("completed", 1))
                     measurement, = results
                     self.assertEqual(measurement.source_file, source)
                     self.assertIsNone(measurement.frequency_khz)
                     self.assertEqual(measurement.report["thresholds"], thresholds)
                     self.assertEqual(len(measurement.report["flatness"]["pulses"]), 3)
-                    summary = summary_for(outcome)
-                    self.assertEqual(summary["mode"], "file")
-                    self.assertEqual(summary["source_file"], str(source))
                     self.assertEqual(source.read_bytes(), original)
-                    with np.load(measurement.capture_path, allow_pickle=False) as saved:
-                        np.testing.assert_array_equal(saved["time_s"], time_s)
-                        np.testing.assert_array_equal(saved["voltage_v"], voltage_v)
+                    self.assertEqual(set(destination.iterdir()), {csv, npz})
 
-    def test_malformed_file_has_readable_error_and_no_capture(self):
+    def test_malformed_file_has_readable_error(self):
         with TemporaryDirectory() as temporary:
             destination = Path(temporary)
             source = destination / "invalid.csv"
             source.write_text("wrong,header\n1,2\n", encoding="utf-8")
-            settings = FileEvaluationSettings(source, destination,
+            settings = FileEvaluationSettings(source,
                                               dict(alignment_tolerance_pct=7.0, raw_limit_pct=20.0))
             results = []
-            outcome = run_evaluation(settings, Event(), lambda _: None, results.append)
-            self.assertEqual((outcome.status, outcome.saved), ("failed", 0))
+            outcome = run_evaluation(settings, Event(), results.append)
+            self.assertEqual((outcome.status, outcome.evaluated), ("failed", 0))
             self.assertIn("CSV表头", outcome.error)
             self.assertFalse(results)
-            self.assertFalse(list(outcome.directory.glob("*.npz")))
-            self.assertEqual(summary_for(outcome)["source_file"], str(source))
+            self.assertEqual(list(destination.iterdir()), [source])
 
 
 if __name__ == "__main__":

@@ -1,19 +1,15 @@
-"""Evaluate and save desktop waveforms from simulation, files or the scope."""
+"""Evaluate desktop waveforms from simulation, files or the scope."""
 
 from dataclasses import dataclass
-from datetime import datetime
 from functools import cache
-from ipaddress import ip_address
 from itertools import product
-import json
 from math import ceil, isfinite
 from pathlib import Path
-from tempfile import NamedTemporaryFile, mkdtemp
 
 import numpy as np
 
 from fiber1100_algorithm import evaluate_shape_record
-from scope_capture import SCOPE_CHANNEL, ScopeFrame
+from scope_capture import ScopeFrame
 from waveform_core.timing_pulses import prepare_timed_waveform
 from waveform_core.waveform_io import load_waveform
 
@@ -42,18 +38,10 @@ def capture_grid(frequency_khz, width_ns):
 class SimulationSettings:
     frequencies: range
     widths: range
-    destination: Path
-    scope_ip: str
-    board_port: str
     alignment_tolerance_pct: float
     raw_limit_pct: float
 
     def __post_init__(self):
-        if self.scope_ip:
-            try:
-                ip_address(self.scope_ip)
-            except ValueError as error:
-                raise ValueError("请输入有效的示波器 IP 地址。") from error
         if not isfinite(self.alignment_tolerance_pct) or self.alignment_tolerance_pct < 0:
             raise ValueError("红蓝高度允许偏差须为非负的有限百分比。")
         if not isfinite(self.raw_limit_pct) or self.raw_limit_pct <= 0:
@@ -81,7 +69,6 @@ class SimulationSettings:
 @dataclass(frozen=True)
 class FileEvaluationSettings:
     source_file: Path
-    destination: Path
     thresholds: dict[str, float]
 
     count = 1
@@ -90,10 +77,7 @@ class FileEvaluationSettings:
 @dataclass(frozen=True)
 class ScopeEvaluationSettings:
     frame: ScopeFrame
-    destination: Path
     thresholds: dict[str, float]
-    scope_ip: str
-    scope_identity: str
 
     count = 1
 
@@ -103,7 +87,6 @@ class Measurement:
     index: int
     frequency_khz: int | None
     width_ns: int | None
-    capture_path: Path
     report: dict
     pulse: dict
     source_file: Path | None = None
@@ -120,8 +103,7 @@ class Measurement:
 @dataclass(frozen=True)
 class SimulationOutcome:
     status: str
-    directory: Path | None
-    saved: int
+    evaluated: int
     error: str = ""
     condition: tuple[int, int] | None = None
 
@@ -175,111 +157,44 @@ def simulate_capture(frequency_khz, width_ns, seed):
     return t * 1e-9, voltage
 
 
-def atomic_write(path, write):
-    temporary = None
-    try:
-        with NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-            temporary = Path(stream.name)
-            write(stream)
-        temporary.replace(path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
-def write_summary(directory, summary):
-    text = json.dumps(summary, ensure_ascii=False, allow_nan=False, indent=2)
-    atomic_write(directory / "run.json", lambda stream: stream.write(text.encode("utf-8")))
-
-
-def run_simulation(settings, cancelled, on_started, on_measurement, *, interval_s=0.20):
-    return run_evaluation(settings, cancelled, on_started, on_measurement, interval_s=interval_s)
+def run_simulation(settings, cancelled, on_measurement, *, interval_s=0.20):
+    return run_evaluation(settings, cancelled, on_measurement, interval_s=interval_s)
 
 
 def run_evaluation(settings: SimulationSettings | FileEvaluationSettings | ScopeEvaluationSettings,
-                   cancelled, on_started, on_measurement, *, interval_s=0.20):
-    """Read, evaluate and save in the calling thread, publishing only saved captures."""
-    directory = condition = None
-    entries = []
-    status = "running"
-    error = ""
+                   cancelled, on_measurement, *, interval_s=0.20):
+    """Evaluate in the calling thread and publish each completed measurement."""
+    condition = None
+    evaluated = 0
     simulated = isinstance(settings, SimulationSettings)
     source_file = settings.source_file if isinstance(settings, FileEvaluationSettings) else None
-    now = datetime.now().astimezone()
-    summary = dict(status=status, started_at=now.isoformat(), thresholds=settings.thresholds,
-                   total=settings.count, measurements=entries)
-    if simulated:
-        summary.update(mode="simulation", scope_ip=settings.scope_ip, board_port=settings.board_port)
-        for name, axis in (("frequency_khz", settings.frequencies), ("width_ns", settings.widths)):
-            summary[name] = dict(start=axis.start, end=axis.stop - 1, step=axis.step)
-        conditions = product(settings.frequencies, settings.widths)
-    else:
-        if source_file is not None:
-            summary.update(mode="file", source_file=str(source_file))
-        else:
-            summary.update(mode="scope", scope_ip=settings.scope_ip, scope_identity=settings.scope_identity,
-                           channel=SCOPE_CHANNEL, frame_received_at=settings.frame.received_at.isoformat())
-        conditions = (None,)
+    conditions = product(settings.frequencies, settings.widths) if simulated else (None,)
     try:
-        settings.destination.mkdir(parents=True, exist_ok=True)
-        directory = Path(mkdtemp(dir=settings.destination, prefix=now.strftime("%Y%m%d_%H%M%S_")))
-        write_summary(directory, summary)
-        on_started(directory)
-        rng = np.random.default_rng()
+        rng = np.random.default_rng() if simulated else None
         for index, point in enumerate(conditions, 1):
             if cancelled.wait(interval_s if index > 1 else 0):
-                status = "stopped"
-                break
+                return SimulationOutcome("stopped", evaluated)
             condition = point
             if simulated:
                 frequency, width = condition
                 time_s, voltage_v = simulate_capture(frequency, width, int(rng.integers(2**32)))
                 record = prepare_timed_waveform(time_s, voltage_v, point=condition)
-                filename = f"{index:04d}_{frequency}kHz_{width}ns.npz"
-                source_fields = dict(frequency_khz=frequency, width_ns=width)
             else:
                 frequency = width = None
                 if source_file is not None:
                     time_s, voltage_v, interval = load_waveform(source_file)
-                    filename = "0001_导入波形.npz"
-                    source_fields = dict(source_file=str(source_file))
                 else:
                     frame = settings.frame
                     time_s, voltage_v, interval = frame.time_s, frame.voltage_v, frame.sample_interval_s
-                    filename = "0001_实测波形.npz"
-                    source_fields = {}
                 record = prepare_timed_waveform(time_s, voltage_v, sample_interval_s=interval,
                                                 path=source_file)
             report = evaluate_shape_record(record, **settings.thresholds)
             if cancelled.is_set():
-                status = "stopped"
-                break
+                return SimulationOutcome("stopped", evaluated)
             pulse = next(pulse for pulse in record.pulses
                          if pulse["number"] == report["shape"]["representative_pulse"])
-            path = directory / filename
-            report_json = json.dumps(report, ensure_ascii=False, allow_nan=False)
-            atomic_write(path, lambda stream: np.savez_compressed(
-                stream, time_s=time_s, voltage_v=voltage_v, evaluation_json=report_json))
-            measurement = Measurement(index, frequency, width, path, report, pulse, source_file)
-            entries.append(dict(**source_fields, capture=path.name,
-                                verdict=measurement.verdict, passed=report["passed"],
-                                alignment_pct=report["shape"]["score_pct"],
-                                raw_flatness_pct=report["flatness"]["raw_max_pct"]))
-            write_summary(directory, summary)
-            on_measurement(measurement)
-            condition = None
-        else:
-            status = "completed"
+            evaluated = index
+            on_measurement(Measurement(index, frequency, width, report, pulse, source_file))
     except Exception as exc:
-        status, error = "failed", str(exc) or type(exc).__name__
-
-    if directory is not None:
-        summary.update(status=status, finished_at=datetime.now().astimezone().isoformat())
-        if error:
-            summary.update(error=error, failed_condition=condition)
-        try:
-            write_summary(directory, summary)
-        except OSError as exc:
-            detail = f"运行汇总保存失败。{exc}"
-            status, error = "failed", f"{error}\n{detail}" if error else detail
-    return SimulationOutcome(status, directory, len(entries), error, condition if error else None)
+        return SimulationOutcome("failed", evaluated, str(exc) or type(exc).__name__, condition)
+    return SimulationOutcome("completed", evaluated)

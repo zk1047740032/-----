@@ -1,8 +1,5 @@
 from datetime import datetime, timezone
 from io import BytesIO
-import json
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from threading import Event
 import unittest
 
@@ -41,28 +38,19 @@ class ScopeCaptureTests(unittest.TestCase):
             with self.subTest(response=response), self.assertRaises(ValueError):
                 read_waveform(BytesIO(response))
 
-    def test_single_evaluation_saves_the_entire_scope_frame(self):
+    def test_single_evaluation_uses_the_entire_scope_frame(self):
         time_s, voltage_v = simulate_capture(100, 150, seed=42)
         time_s.flags.writeable = voltage_v.flags.writeable = False
         frame = ScopeFrame(time_s, voltage_v, 0.2e-9, datetime(2026, 11, 25, tzinfo=timezone.utc))
         thresholds = dict(alignment_tolerance_pct=4.0, raw_limit_pct=13.0)
-        address, identity = "127.0.0.1", "TEKTRONIX,MDO3014,test,1.0"
-        with TemporaryDirectory() as destination:
-            settings = ScopeEvaluationSettings(frame, Path(destination), thresholds, address, identity)
-            measurements = []
-            outcome = run_evaluation(settings, Event(), lambda _: None, measurements.append)
-            self.assertEqual(outcome.status, "completed", outcome.error)
-            self.assertEqual(len(measurements), 1)
-            measurement = measurements[0]
-            with np.load(measurement.capture_path, allow_pickle=False) as saved:
-                np.testing.assert_array_equal(saved["time_s"], time_s)
-                np.testing.assert_array_equal(saved["voltage_v"], voltage_v)
-                self.assertEqual(json.loads(str(saved["evaluation_json"]))["thresholds"], thresholds)
-            summary = json.loads((outcome.directory / "run.json").read_text(encoding="utf-8"))
-            for name, value in dict(mode="scope", channel="CH2", scope_ip=address, scope_identity=identity,
-                                    frame_received_at=frame.received_at.isoformat()).items():
-                self.assertEqual(summary[name], value)
-            expected = evaluate_waveform(time_s, voltage_v, **thresholds)
-            self.assertEqual(measurement.report["passed"], expected["passed"])
-            self.assertAlmostEqual(measurement.report["shape"]["score_pct"], expected["shape"]["score_pct"])
-            self.assertAlmostEqual(measurement.report["flatness"]["raw_max_pct"], expected["flatness"]["raw_max_pct"])
+        settings = ScopeEvaluationSettings(frame, thresholds)
+        measurements = []
+        outcome = run_evaluation(settings, Event(), measurements.append)
+        self.assertEqual((outcome.status, outcome.evaluated), ("completed", 1), outcome.error)
+        measurement, = measurements
+        expected = evaluate_waveform(time_s, voltage_v, **thresholds)
+        self.assertEqual(measurement.report["thresholds"], thresholds)
+        self.assertEqual(len(measurement.report["flatness"]["pulses"]), 3)
+        self.assertEqual(measurement.report["passed"], expected["passed"])
+        self.assertAlmostEqual(measurement.report["shape"]["score_pct"], expected["shape"]["score_pct"])
+        self.assertAlmostEqual(measurement.report["flatness"]["raw_max_pct"], expected["flatness"]["raw_max_pct"])

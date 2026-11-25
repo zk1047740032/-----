@@ -137,7 +137,6 @@ class SimulationSwitch(W.QAbstractButton):
 
 
 class EvaluationThread(QThread):
-    directory_ready = Signal(object)
     measurement_ready = Signal(object)
 
     def __init__(self, settings, parent):
@@ -147,8 +146,7 @@ class EvaluationThread(QThread):
         self.outcome = None
 
     def run(self):
-        self.outcome = run_evaluation(self.settings, self.cancelled,
-                                     self.directory_ready.emit, self.measurement_ready.emit)
+        self.outcome = run_evaluation(self.settings, self.cancelled, self.measurement_ready.emit)
 
 
 class ScopeThread(QThread):
@@ -318,11 +316,12 @@ class WaveformWindow(W.QMainWindow):
             self.board_port, self.board_refresh_button, self.board_button))
         self.refresh_ports()
         documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
-        self.destination = W.QLineEdit(str((Path(documents) if documents else Path.home()) / "方波评价结果"))
-        self.destination.setAccessibleName("保存地址")
+        self.screenshot_directory = W.QLineEdit(str((Path(documents) if documents else Path.home()) / "示波器截图"))
+        self.screenshot_directory.setAccessibleName("截图目录")
+        self.screenshot_directory.setToolTip("自动调平达标后保存示波器截图的目录。")
         browse = W.QPushButton("浏览")
-        browse.clicked.connect(self.choose_directory)
-        connection.addRow("保存地址", self.field_with_buttons(self.destination, browse))
+        browse.clicked.connect(self.choose_screenshot_directory)
+        connection.addRow("截图目录", self.field_with_buttons(self.screenshot_directory, browse))
         fields.addLayout(connection)
 
         fields.addWidget(label("算法参数", "section"))
@@ -710,10 +709,10 @@ class WaveformWindow(W.QMainWindow):
         self.board_connection = None
         self.append_log(f"已关闭脉冲板串口 {connection.port}。", level="system")
 
-    def choose_directory(self):
-        directory = W.QFileDialog.getExistingDirectory(self, "选择结果保存目录", self.destination.text())
+    def choose_screenshot_directory(self):
+        directory = W.QFileDialog.getExistingDirectory(self, "选择示波器截图目录", self.screenshot_directory.text())
         if directory:
-            self.destination.setText(str(Path(directory)))
+            self.screenshot_directory.setText(str(Path(directory)))
 
     def update_controls(self):
         busy = self.worker is not None
@@ -758,12 +757,6 @@ class WaveformWindow(W.QMainWindow):
         self.update_controls()
         self.append_log(f"模拟模式已{state}。", level="system")
 
-    def destination_path(self):
-        destination = self.destination.text().strip()
-        if not destination:
-            raise ValueError("请选择保存目录。")
-        return Path(destination).expanduser().resolve()
-
     def evaluation_thresholds(self):
         return dict(alignment_tolerance_pct=self.alignment.value(), raw_limit_pct=self.raw_limit.value())
 
@@ -775,18 +768,10 @@ class WaveformWindow(W.QMainWindow):
             return scan_axis(*(widget.value() for widget in widgets), name)
 
         return SimulationSettings(axis(self.frequencies, "重频"), axis(self.widths, "脉宽"),
-                                  self.destination_path(), self.scope_ip.text().strip(),
-                                  self.board_port.currentData(), self.alignment.value(), self.raw_limit.value())
+                                  **self.evaluation_thresholds())
 
     def open_waveform(self):
         if self.worker is not None:
-            return
-        try:
-            destination = self.destination_path()
-        except (OSError, ValueError) as error:
-            self.append_log(f"参数有误。{error}", level="warning")
-            if self.displayed_frame is None:
-                self.progress_label.setText("请检查参数")
             return
         selected, _ = W.QFileDialog.getOpenFileName(
             self, "打开波形文件", self.waveform_directory, "波形文件 (*.csv *.npz)")
@@ -796,7 +781,7 @@ class WaveformWindow(W.QMainWindow):
         self.waveform_directory = str(source.parent)
         if self.scope_thread is not None and self.scope_thread.live:
             self.disconnect_scope()
-        self.start_evaluation(FileEvaluationSettings(source, destination, self.evaluation_thresholds()))
+        self.start_evaluation(FileEvaluationSettings(source, self.evaluation_thresholds()))
 
     def single_evaluation(self):
         if self.scope_frozen:
@@ -817,21 +802,15 @@ class WaveformWindow(W.QMainWindow):
         frame = self.displayed_frame
         if self.worker is not None or frame is None or scope is None or scope.cancelled.is_set():
             return
-        try:
-            destination = self.destination_path()
-        except (OSError, ValueError) as error:
-            self.append_log(f"参数有误。{error}", level="warning")
-            return
         self.scope_frozen = True
-        self.start_evaluation(ScopeEvaluationSettings(frame, destination, self.evaluation_thresholds(),
-                                                      scope.address, scope.identity))
+        self.start_evaluation(ScopeEvaluationSettings(frame, self.evaluation_thresholds()))
 
     def start_run(self, *, single):
         if self.worker is not None or not self.simulation_toggle.isChecked():
             return
         try:
             settings = self.run_settings(single)
-        except (OSError, ValueError) as error:
+        except ValueError as error:
             self.append_log(f"参数有误。{error}", level="warning")
             self.progress_label.setText("请检查参数")
             return
@@ -869,14 +848,10 @@ class WaveformWindow(W.QMainWindow):
         self.raw_threshold.setText(f"要求 <{thresholds['raw_limit_pct']:g}%")
         worker = EvaluationThread(settings, self)
         self.worker = worker
-        worker.directory_ready.connect(self.show_directory)
         worker.measurement_ready.connect(self.show_measurement)
         worker.finished.connect(self.finish_run)
         self.update_controls()
         worker.start()
-
-    def show_directory(self, directory):
-        self.append_log(f"保存目录  {directory}")
 
     def stop_run(self):
         if self.worker is None or self.worker.cancelled.is_set():
@@ -917,14 +892,14 @@ class WaveformWindow(W.QMainWindow):
             self.append_log(f"运行失败  {point}  {outcome.error}", level="error")
         elif stopped or outcome.status == "stopped":
             self.progress_label.setText("已停止")
-            unit = "份文件结果" if file_mode else "个工况"
-            self.append_log(f"流程已停止，已保存 {outcome.saved} {unit}。", level="warning")
+            unit = "个文件" if file_mode else "个工况"
+            self.append_log(f"流程已停止，已评价 {outcome.evaluated} {unit}。", level="warning")
         elif file_mode:
             self.progress_label.setText("文件评价完成")
-            self.append_log("文件评价完成，已保存结果。")
+            self.append_log("文件评价完成。")
         else:
-            self.progress_label.setText(f"模拟完成  {outcome.saved} / {worker.settings.count}")
-            self.append_log(f"流程完成，已保存 {outcome.saved} 个工况。")
+            self.progress_label.setText(f"模拟完成  {outcome.evaluated} / {worker.settings.count}")
+            self.append_log(f"流程完成，已评价 {outcome.evaluated} 个工况。")
         self.update_controls()
         if self.closing:
             self.close()
@@ -938,12 +913,12 @@ class WaveformWindow(W.QMainWindow):
                 self.reason.setText(outcome.error)
         elif stopped or outcome.status == "stopped":
             state = "评价已停止"
-            self.append_log(f"实机单次评价已停止，已保存 {outcome.saved} 份结果。", level="warning")
+            self.append_log("实机单次评价已停止。", level="warning")
             if self.scope_frozen:
                 self.set_verdict("已停止")
         else:
             state = "评价完成"
-            self.append_log("实机单次评价完成，已保存结果。")
+            self.append_log("实机单次评价完成。")
         if self.scope_frozen:
             self.progress_label.setText(f"已固定 · {state}")
 
@@ -1017,8 +992,7 @@ class WaveformWindow(W.QMainWindow):
         verdict = measurement.verdict
         state, level = {"达标": ("pass", "success"), "未达标": ("fail", "error"),
                         "待复核": ("review", "warning")}[verdict]
-        self.append_log(f"{point}  {verdict}  红蓝 {aligned_value}  不平度 {raw_value}", level=level)
-        self.append_log(f"已保存 {measurement.capture_path.name}", level="success")
+        self.append_log(f"{point}  {verdict}  红蓝偏差 {aligned_value}  不平度 {raw_value}", level=level)
         if self.worker.cancelled.is_set() or (scope_mode and not self.scope_frozen):
             return
         self.progress.setValue(measurement.index)
