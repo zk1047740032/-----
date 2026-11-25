@@ -16,11 +16,11 @@ from .shape_feedback import _region_assessment
 
 DEFAULT_ALIGNMENT_TOLERANCE_PCT = 7.0
 ALIGNMENT_TOLERANCE_EPS = 1e-12
-AXIS_LABELS = {"y0": "肩部", "y1": "平顶前段", "y2": "平顶中段"}
+AXIS_LABELS = {"y0": "左肩", "y1": "平顶前段", "y2": "平顶中段"}
 # Phase 0 and 1 are the two half-height crossings. These positions are
 # observation windows taken from the figure, not calibrated response limits.
 OBSERVATION_WINDOWS = {
-    "y0": (0., .105),
+    "y0": (.04, .125),
     "y1": (.125, .215),
     "y2": (.37, .55),
     "reference": (.635, .755),
@@ -53,10 +53,12 @@ def _clip_regions(phase):
     left, right = phase
     regions = {}
     for name, (lo, hi) in OBSERVATION_WINDOWS.items():
+        if name == "y0":
+            # The annotated left shoulder can precede the hold start.
+            regions[name] = (lo, hi)
+            continue
         a, b = max(left, lo), min(right, hi)
-        # y0 is intentionally clipped at the end of the rising slope.
-        minimum = 0. if name == "y0" else (hi-lo)/2
-        regions[name] = (a, b) if b > a and b-a >= minimum else None
+        regions[name] = (a, b) if b-a >= (hi-lo)/2 else None
     return regions
 
 
@@ -103,7 +105,7 @@ def adjust_reference_window(record, window, *, confirmed_phase=None):
                 evidence="manual" if confirmed else window.get("evidence"),
                 sensitivity_phase_bands=bands, sensitivity_windows=scenarios,
                 sensitivity_available=sensitivity_available, alignment_windows=regions,
-                alignment_window_basis="annotated_w50_v1",
+                alignment_window_basis="annotated_w50_v3",
                 alignment_ramp=dict(supported_pulses=len(ramp_ends), total_pulses=len(record.pulses),
                                     later_than_hold=sum(end > phase[0] for end in ramp_ends),
                                     estimated_range=[min(ramp_ends), max(ramp_ends)] if ramp_ends else None),

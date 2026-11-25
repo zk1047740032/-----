@@ -14,6 +14,19 @@ def capture(seed, dip=0., *, width=150):
 
 
 class ReferenceAlignmentTests(unittest.TestCase):
+    def test_y0_stays_on_the_left_shoulder_when_hold_start_moves(self):
+        record = capture(1, -.12)
+        initial = evaluate_shape_record(record, alignment_tolerance_pct=7.)
+        for hold_start in (.065, .116, .14):
+            with self.subTest(hold_start=hold_start):
+                hold = (hold_start, .755)
+                report = evaluate_shape_record(record, alignment_tolerance_pct=7., confirmed_phase=hold)
+                window = report["window"]
+                self.assertEqual(window["phase"], hold)
+                self.assertEqual(window["alignment_windows"]["y0"], (.04, .125))
+                self.assertEqual(report["shape"]["regions"]["y0"], initial["shape"]["regions"]["y0"])
+                self.assertIsNotNone(report["shape"]["score_pct"])
+
     def test_thresholds_reclassify_same_numbers_without_another_capture(self):
         record = capture(1, -.12)
         initial = evaluate_shape_record(record, alignment_tolerance_pct=3.)
@@ -51,7 +64,7 @@ class ReferenceAlignmentTests(unittest.TestCase):
         self.assertEqual(target["next_action"], {"kind": "trial", "axis": "y2", "step": 10})
         y0 = session.window["alignment_windows"]["y0"]
         blue = session.window["alignment_windows"]["reference"]
-        self.assertEqual(y0[0], session.window["phase"][0])
+        self.assertEqual(y0, (.04, .125))
         self.assertEqual(blue[1], session.window["phase"][1])
         self.assertLess(blue[1], .9)
         after = capture(4, -.12)
