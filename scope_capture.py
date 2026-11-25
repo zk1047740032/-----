@@ -1,6 +1,6 @@
 """Read synchronized Tektronix waveform frames over the SCPI socket server."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from math import isfinite
 
@@ -21,6 +21,7 @@ class ScopeFrame:
     voltage_v: np.ndarray
     sample_interval_s: float
     received_at: datetime
+    horizontal_scale_s: float | None = None
 
 
 def read_waveform(stream):
@@ -136,6 +137,13 @@ class ScopeConnection:
             except TimeoutError as error:
                 raise TimeoutError(f"读取波形超时，请确认 {SCOPE_CHANNEL} 已开启并采集到波形。") from error
             if frame.time_s.size == points:
-                return frame
+                scale = self.query("HORIZONTAL:SCALE?").split()
+                try:
+                    scale_s = float(scale[-1])
+                except (IndexError, ValueError) as error:
+                    raise ValueError("示波器返回的水平标度无效。") from error
+                if scale_s <= 0 or not isfinite(scale_s):
+                    raise ValueError("示波器返回的水平标度无效。")
+                return replace(frame, horizontal_scale_s=scale_s)
             self.stop_point = None
         raise ValueError("传回的波形点数与当前记录长度不一致，请重新连接示波器。")

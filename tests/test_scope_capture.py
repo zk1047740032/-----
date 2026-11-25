@@ -2,11 +2,12 @@ from datetime import datetime, timezone
 from io import BytesIO
 from threading import Event
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 
 from fiber1100_algorithm import evaluate_waveform
-from scope_capture import ScopeFrame, read_waveform
+from scope_capture import ScopeConnection, ScopeFrame, read_waveform
 from waveform_simulation import ScopeEvaluationSettings, run_evaluation, simulate_capture
 
 
@@ -24,6 +25,22 @@ class ScopeCaptureTests(unittest.TestCase):
         np.testing.assert_allclose(frame.voltage_v, (raw.astype(float) - 10) * 0.002 + 0.13)
         self.assertFalse(frame.voltage_v.flags.writeable)
         self.assertEqual(response.readline(), b"next response\n")
+
+    def test_horizontal_scale_is_read_for_each_frame_independently_of_sample_spacing(self):
+        capture = b":HORIZONTAL:RECORDLENGTH 20\n" + PREAMBLE + b"#240" + bytes(40) + b"\n"
+        stream = BytesIO(capture + b":HORIZONTAL:SCALE 4.0000E-8\n"
+                         + capture + b"8.0000E-8\n" + capture + b"0\n")
+        socket = Mock()
+        scope = ScopeConnection(socket, stream)
+        first = scope.read_frame()
+        second = scope.read_frame()
+        self.assertEqual((first.horizontal_scale_s, second.horizontal_scale_s), (40e-9, 80e-9))
+        np.testing.assert_array_equal(first.time_s, second.time_s)
+        self.assertEqual(second.sample_interval_s, 2e-9)
+        with self.assertRaisesRegex(ValueError, "水平标度无效"):
+            scope.read_frame()
+        commands = [call.args[0] for call in socket.sendall.call_args_list]
+        self.assertEqual(commands.count(b"HORIZONTAL:SCALE?\n"), 3)
 
     def test_incomplete_or_unsupported_frame_is_rejected(self):
         payload = bytes(40)

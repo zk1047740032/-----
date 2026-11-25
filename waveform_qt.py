@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from ipaddress import ip_address
+from math import ceil
 from pathlib import Path
 import socket
 import sys
@@ -96,6 +97,17 @@ def card():
     frame = W.QFrame()
     frame.setProperty("card", True)
     return frame
+
+
+class ScopeTimeAxis(pg.AxisItem):
+    def tickSpacing(self, minVal, maxVal, size):
+        levels = super().tickSpacing(minVal, maxVal, size)
+        if len(levels) != 1:
+            return levels
+        spacing, offset = levels[0]
+        # When zoomed far out, skip divisions while keeping the scope grid aligned.
+        step = max(1, ceil((maxVal - minVal) / (100 * spacing)))
+        return [(spacing * step, offset)]
 
 
 class SimulationSwitch(W.QAbstractButton):
@@ -413,7 +425,8 @@ class WaveformWindow(W.QMainWindow):
         content.setSpacing(12)
         frame = W.QVBoxLayout()
         frame.setSpacing(4)
-        self.plot = pg.PlotWidget(background="#ffffff")
+        self.time_axis = ScopeTimeAxis("bottom")
+        self.plot = pg.PlotWidget(background="#ffffff", axisItems={"bottom": self.time_axis})
         self.plot.setMinimumSize(0, 140)
         self.plot.setLabel("left", "电压", units="V", color="#6b7280")
         self.plot.showGrid(x=True, y=True, alpha=0.22)
@@ -426,9 +439,6 @@ class WaveformWindow(W.QMainWindow):
         frame.addWidget(self.plot, 1)
         legend_row = W.QHBoxLayout()
         self.window_legend = label("保持期 · 红区 y0–y2 · 蓝区参考", "muted")
-        legend_policy = self.window_legend.sizePolicy()
-        legend_policy.setRetainSizeWhenHidden(True)
-        self.window_legend.setSizePolicy(legend_policy)
         self.window_legend.setWordWrap(True)
         legend_row.addWidget(self.window_legend, 1)
         self.zoom_button = W.QPushButton("重置缩放")
@@ -605,11 +615,14 @@ class WaveformWindow(W.QMainWindow):
         first_frame = self.displayed_frame is None
         if self.scope_curve is None:
             self.plot.setLabel("bottom", "相对触发时刻", units="ns", color="#6b7280")
-            self.window_legend.hide()
             self.scope_curve = self.plot.plot(pen=pg.mkPen("#2563eb", width=2), clipToView=True,
                                               autoDownsample=True, downsampleMethod="peak")
             self.plot.enableAutoRange()
             self.zoom_button.setEnabled(True)
+        scale_s = frame.horizontal_scale_s
+        if scale_s is not None and (first_frame or scale_s != self.displayed_frame.horizontal_scale_s):
+            self.time_axis.setTickSpacing(levels=[(scale_s * 1e9, 0)])
+            self.window_legend.setText(f"水平标度  {pg.siFormat(scale_s, suffix='s', precision=6)}/格")
         self.scope_curve.setData(frame.time_s * 1e9, frame.voltage_v)
         self.displayed_frame = frame
         received = frame.received_at.strftime("%H:%M:%S.%f")[:-3]
@@ -955,11 +968,12 @@ class WaveformWindow(W.QMainWindow):
 
     def clear_measurement(self):
         self.plot.clear()
+        self.time_axis.setTickSpacing()
         self.plot.setLabel("bottom", "相对上升 50% 交点", units="ns", color="#6b7280")
         self.plot.setRange(xRange=(0, 100), yRange=(0, 1), padding=0)
         self.scope_curve = None
         self.displayed_frame = None
-        self.window_legend.show()
+        self.window_legend.setText("保持期 · 红区 y0–y2 · 蓝区参考")
         self.zoom_button.setEnabled(False)
         self.condition.clear()
         self.condition.setToolTip("")
