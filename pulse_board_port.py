@@ -9,6 +9,8 @@ from serial import EIGHTBITS, PARITY_NONE, STOPBITS_ONE, Serial
 
 
 BOARD_BAUDRATE = 115_200
+SHAPE_INDEX_D = 120
+SHAPE_REGISTER_MAX = 0xFFFF
 FRAME_PREFIX = b"\x57\x00\x00"
 FRAME_END = b"\r\n"
 STATUS_COMMAND = 0x32
@@ -72,6 +74,13 @@ class PulseBoardPort:
     def set_shape_raw(self, y0: bytes, y1: bytes, y2: bytes, index_d: bytes) -> PulseBoardState:
         shape = _register_bytes(y0, y1, y2, index_d)
         return self._set_parameters(0x42, shape, slice(5, 13), shape)
+
+    def set_shape(self, y0: int, y1: int, y2: int) -> PulseBoardState:
+        values = (y0, y1, y2, SHAPE_INDEX_D)
+        if any(not isinstance(value, int) or not 0 <= value <= SHAPE_REGISTER_MAX for value in values):
+            raise ValueError(f"y0、y1、y2 须为 0–{SHAPE_REGISTER_MAX} 的整数。")
+        # The 1100 protocol example uses high-byte-first values. Verify this on the pulse board.
+        return self.set_shape_raw(*(value.to_bytes(2, "big") for value in values))
 
     def _set_parameters(self, command: int, parameters: bytes, readback: slice,
                         expected: bytes) -> PulseBoardState:

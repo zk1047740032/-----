@@ -47,6 +47,21 @@ class PulseBoardPortTests(unittest.TestCase):
             call.reset_input_buffer(), call.write(shape_request), call.read(22),
         ])
 
+    def test_numeric_y_values_use_high_byte_first_and_fixed_index_d(self):
+        request = bytes.fromhex("57 00 00 42 08 04 B0 06 A4 09 60 00 78 89 4D 0D 0A")
+        self.serial.read.return_value = bytes.fromhex(
+            "57 00 00 32 0D 01 23 04 56 01 04 B0 06 A4 09 60 00 78 FD 49 0D 0A"
+        )
+        status = self.board.set_shape(1200, 1700, 2400)
+        self.serial.write.assert_called_once_with(request)
+        self.assertEqual(status.index_d, b"\x00\x78")
+
+    def test_invalid_numeric_y_value_is_rejected_before_writing(self):
+        for value in (-1, 65536, 1700.5):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "0–65535"):
+                self.board.set_shape(1200, value, 2400)
+        self.serial.write.assert_not_called()
+
     def test_bad_frame_is_rejected(self):
         for offset in (0, 1, 2, 3, 4, -4, -3, -2, -1):
             with self.subTest(offset=offset):

@@ -9,11 +9,11 @@ from threading import Event
 
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QRectF, QStandardPaths, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QFont, QIcon, QIntValidator, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6 import QtWidgets as W
 from serial.tools.list_ports import comports
 
-from pulse_board_port import BOARD_BAUDRATE, PulseBoardPort
+from pulse_board_port import BOARD_BAUDRATE, SHAPE_INDEX_D, SHAPE_REGISTER_MAX, PulseBoardPort
 from scope_capture import SCOPE_CHANNEL, SCOPE_PORT, SCOPE_TIMEOUT_S, ScopeConnection
 from waveform_core.reference_alignment import AXIS_LABELS, DEFAULT_ALIGNMENT_TOLERANCE_PCT
 from waveform_simulation import (
@@ -210,6 +210,20 @@ class BoardPortThread(QThread):
             self.error = str(error)
 
 
+class BoardShapeThread(QThread):
+    def __init__(self, connection, values, parent):
+        super().__init__(parent)
+        self.connection = connection
+        self.values = values
+        self.error = None
+
+    def run(self):
+        try:
+            self.connection.set_shape(*self.values)
+        except (OSError, ValueError) as error:
+            self.error = error
+
+
 class WaveformWindow(W.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -224,7 +238,7 @@ class WaveformWindow(W.QMainWindow):
         self.closing = False
         self.waveform_directory = ""
         self.setStyleSheet(STYLE)
-        self.setMinimumSize(820, 480)
+        self.setMinimumSize(820, 520)
 
         central = W.QWidget()
         self.setCentralWidget(central)
@@ -466,6 +480,27 @@ class WaveformWindow(W.QMainWindow):
         self.reason = label("", "muted")
         self.reason.setWordWrap(True)
         metrics.addWidget(self.reason)
+
+        y_fields = W.QGridLayout()
+        y_fields.setHorizontalSpacing(6)
+        y_fields.setVerticalSpacing(0)
+        self.y_inputs = []
+        for column, (axis, default) in enumerate((("y0", 1200), ("y1", 1700), ("y2", 2400))):
+            field = W.QLineEdit(str(default))
+            field.setValidator(QIntValidator(0, SHAPE_REGISTER_MAX, field))
+            field.setAccessibleName(axis)
+            self.y_inputs.append(field)
+            axis_label = label(axis, "muted")
+            axis_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            axis_label.setBuddy(field)
+            y_fields.addWidget(axis_label, 0, column)
+            y_fields.addWidget(field, 1, column)
+            y_fields.setColumnStretch(column, 1)
+        metrics.addLayout(y_fields)
+        self.set_y_button = W.QPushButton("设置")
+        self.set_y_button.setAccessibleName("设置 y 值")
+        self.set_y_button.clicked.connect(self.set_board_shape)
+        metrics.addWidget(self.set_y_button)
         metrics.addStretch()
         results = W.QWidget()
         results.setFixedWidth(208)
@@ -633,6 +668,36 @@ class WaveformWindow(W.QMainWindow):
         if self.closing:
             self.close()
 
+    def set_board_shape(self):
+        if not self.set_y_button.isEnabled():
+            return
+        values = []
+        for field in self.y_inputs:
+            if not field.hasAcceptableInput():
+                self.append_log(f"{field.accessibleName()} 须为 0–{SHAPE_REGISTER_MAX} 的整数。", level="warning")
+                field.setFocus()
+                return
+            value, _ = field.validator().locale().toInt(field.text())
+            values.append(value)
+        thread = BoardShapeThread(self.board_connection, values, self)
+        self.board_thread = thread
+        thread.finished.connect(self.finish_board_shape)
+        self.update_controls()
+        thread.start()
+
+    def finish_board_shape(self):
+        thread = self.board_thread
+        self.board_thread = None
+        thread.deleteLater()
+        if thread.error is None:
+            y0, y1, y2 = thread.values
+            self.append_log(f"脉冲板回读一致。y0={y0}，y1={y1}，y2={y2}，index_d={SHAPE_INDEX_D}。", level="success")
+        else:
+            self.append_log(f"脉冲板 y 值设置失败。{thread.error}", level="error")
+        self.update_controls()
+        if self.closing:
+            self.close()
+
     def disconnect_board(self):
         connection = self.board_connection
         if connection is None:
@@ -673,6 +738,9 @@ class WaveformWindow(W.QMainWindow):
         self.board_button.setEnabled(board_ready)
         self.board_button.setText("断开" if board_connected else "连接")
         self.board_button.setAccessibleName("断开脉冲板串口" if board_connected else "连接脉冲板串口")
+        self.set_y_button.setEnabled(board_ready and board_connected and not simulated)
+        self.set_y_button.setToolTip("关闭模拟并连接脉冲板后可设置 y 值。" if simulated or not board_connected
+                                     else f"下发三个 y 值，index_d 固定为 {SHAPE_INDEX_D}。")
         self.start_button.setEnabled(available and simulated)
         self.single_button.setText("恢复" if self.scope_frozen else "单次评价")
         self.single_button.setEnabled(can_resume or (available and (simulated or can_freeze)))
@@ -992,7 +1060,8 @@ class WaveformWindow(W.QMainWindow):
         self.reset_zoom()
 
     def closeEvent(self, event):
-        self.disconnect_board()
+        if self.board_thread is None:
+            self.disconnect_board()
         if self.scope_thread is None and self.worker is None and self.board_thread is None:
             super().closeEvent(event)
             return
