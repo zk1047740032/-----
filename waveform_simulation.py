@@ -18,8 +18,8 @@ from waveform_core.timing_pulses import prepare_timed_waveform
 from waveform_core.waveform_io import load_waveform
 
 
-DEFAULT_FREQUENCY = (80, 200, 20)
-DEFAULT_WIDTH = (100, 800, 100)
+DEFAULT_FREQUENCY = (50, 150, 10)
+DEFAULT_WIDTH = (100, 800, 50)
 DEFAULT_RAW_LIMIT = 20.0
 MAX_CAPTURE_SAMPLES = 1_000_000
 TEMPLATE_INTERVAL_NS = 0.2

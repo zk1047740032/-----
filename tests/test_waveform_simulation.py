@@ -23,7 +23,7 @@ from waveform_simulation import (
 def settings_for(destination, **overrides):
     values = dict(frequencies=scan_axis(*DEFAULT_FREQUENCY, "重频"),
                   widths=scan_axis(*DEFAULT_WIDTH, "脉宽"), destination=Path(destination),
-                  scope_ip="192.168.1.10", board_port="COM42",
+                  scope_ip="192.168.7.12", board_port="COM42",
                   alignment_tolerance_pct=7.0, raw_limit_pct=20.0)
     return SimulationSettings(**(values | overrides))
 

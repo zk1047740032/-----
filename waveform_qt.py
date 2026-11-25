@@ -270,7 +270,7 @@ class WaveformWindow(W.QMainWindow):
         connection = W.QFormLayout()
         connection.setHorizontalSpacing(9)
         connection.setVerticalSpacing(6)
-        self.scope_ip = W.QLineEdit(placeholderText="例如 192.168.1.10")
+        self.scope_ip = W.QLineEdit("192.168.7.12")
         self.scope_ip.setAccessibleName("示波器 IP")
         self.scope_button = W.QPushButton("连接")
         self.scope_button.clicked.connect(self.connect_scope)
