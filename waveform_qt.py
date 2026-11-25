@@ -13,7 +13,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QTextCharFormat,
 from PySide6 import QtWidgets as W
 from serial.tools.list_ports import comports
 
-from pulse_board_port import PulseBoardPort
+from pulse_board_port import BOARD_BAUDRATE, PulseBoardPort
 from scope_capture import SCOPE_CHANNEL, SCOPE_PORT, SCOPE_TIMEOUT_S, ScopeConnection
 from waveform_core.reference_alignment import AXIS_LABELS, DEFAULT_ALIGNMENT_TOLERANCE_PCT
 from waveform_simulation import (
@@ -614,7 +614,6 @@ class WaveformWindow(W.QMainWindow):
             self.board_port.setFocus()
             return
 
-        self.append_log(f"正在打开脉冲板串口 {port}。", level="system")
         thread = BoardPortThread(port, self)
         self.board_thread = thread
         thread.finished.connect(self.finish_board_connection)
