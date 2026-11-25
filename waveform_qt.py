@@ -7,8 +7,8 @@ import sys
 from threading import Event
 
 import pyqtgraph as pg
-from PySide6.QtCore import QStandardPaths, QThread, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QRectF, QStandardPaths, QThread, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6 import QtWidgets as W
 from serial.tools.list_ports import comports
 
@@ -38,10 +38,6 @@ QLabel[role="heading"] { color: #34495e; font-size: 16px; font-weight: 700; }
 QLabel[role="section"] { color: #2c3e50; font-weight: 700; }
 QLabel[role="muted"] { color: #6b7280; }
 QLabel[role="value"] { color: #34495e; font-size: 20px; font-weight: 700; }
-QLabel[role="mode"] {
-    color: #2d6cdf; background: #eaf1fd; border: 1px solid #cdddf7;
-    border-radius: 12px; padding: 5px 12px; font-weight: 700;
-}
 QLabel[role="verdict"] {
     color: #6b7280; background: #eef0f1; border-radius: 9px; padding: 5px 10px;
     font-weight: 700;
@@ -100,6 +96,45 @@ def card():
     return frame
 
 
+class SimulationSwitch(W.QAbstractButton):
+    def __init__(self):
+        super().__init__()
+        self.setCheckable(True)
+        self.setChecked(True)
+        self.setFixedSize(56, 36)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName("模拟模式")
+
+    def paintEvent(self, _event):
+        checked = self.isChecked()
+        enabled = self.isEnabled()
+        if enabled:
+            fill, border = ("#23a653", "#168540") if checked else ("#d9dfe7", "#b5bfcb")
+        else:
+            fill, border = ("#b1d5bf", "#9dbfac") if checked else ("#edf0f4", "#d5dde6")
+        track = QRectF(4, 6, 48, 24)
+        knob_x = track.right() - 22 if checked else track.left() + 2
+        knob = QRectF(knob_x, track.top() + 2, 20, 20)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self.hasFocus():
+            painter.setPen(QPen(QColor("#2d6cdf"), 1.5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(track.adjusted(-2.5, -2.5, 2.5, 2.5), 15, 15)
+        painter.setPen(QPen(QColor(border)))
+        painter.setBrush(QColor(fill))
+        painter.drawRoundedRect(track, 12, 12)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 27))
+        painter.drawEllipse(knob.translated(0, 1))
+        painter.setPen(QPen(QColor("#d7dfe8")))
+        painter.setBrush(QColor("#ffffff" if enabled else "#f6f8fa"))
+        painter.drawEllipse(knob)
+        painter.end()
+
+
 class EvaluationThread(QThread):
     directory_ready = Signal(object)
     measurement_ready = Signal(object)
@@ -134,8 +169,11 @@ class WaveformWindow(W.QMainWindow):
         header = W.QHBoxLayout()
         header.addWidget(label("方波自动化", "title"))
         header.addStretch()
-        self.mode = label("模拟模式", "mode")
-        header.addWidget(self.mode)
+        header.addWidget(label("模拟模式", "section"))
+        self.simulation_toggle = SimulationSwitch()
+        self.simulation_toggle.setToolTip("控制「开始」和「单次评价」是否可用。")
+        self.simulation_toggle.toggled.connect(self.toggle_simulation)
+        header.addWidget(self.simulation_toggle)
         root.addLayout(header)
 
         splitter = W.QSplitter(Qt.Orientation.Vertical)
@@ -184,9 +222,9 @@ class WaveformWindow(W.QMainWindow):
         connection.setVerticalSpacing(6)
         self.scope_ip = W.QLineEdit(placeholderText="例如 192.168.1.10")
         self.scope_ip.setAccessibleName("示波器 IP")
-        self.scope_check_button = W.QPushButton("检查")
-        self.scope_check_button.setAccessibleName("检查示波器通信")
-        self.scope_check_button.setToolTip(f"使用 TCP {SCOPE_PORT} 查询示波器身份。")
+        self.scope_check_button = W.QPushButton("连接")
+        self.scope_check_button.setAccessibleName("连接示波器")
+        self.scope_check_button.setToolTip(f"通过 TCP {SCOPE_PORT} 连接示波器并查询型号。")
         self.scope_check_button.clicked.connect(self.check_scope)
         connection.addRow("示波器 IP", self.field_with_button(self.scope_ip, self.scope_check_button))
         self.board_port = W.QComboBox()
@@ -404,7 +442,7 @@ class WaveformWindow(W.QMainWindow):
 
         self.scope_ip.setEnabled(False)
         self.scope_check_button.setEnabled(False)
-        self.append_log(f"检查示波器 {address}（TCP {SCOPE_PORT}）。", level="system")
+        self.append_log(f"正在连接示波器 {address}（TCP {SCOPE_PORT}）。", level="system")
         probe = ScopeProbe(address, self)
         self.scope_probe = probe
         probe.finished.connect(self.finish_scope_check)
@@ -443,11 +481,18 @@ class WaveformWindow(W.QMainWindow):
             self.destination.setText(str(Path(directory)))
 
     def set_busy(self, busy):
+        can_simulate = not busy and self.simulation_toggle.isChecked()
         self.form.setEnabled(not busy)
-        self.start_button.setEnabled(not busy)
-        self.single_button.setEnabled(not busy)
+        self.simulation_toggle.setEnabled(not busy)
+        self.start_button.setEnabled(can_simulate)
+        self.single_button.setEnabled(can_simulate)
         self.open_button.setEnabled(not busy)
         self.stop_button.setEnabled(busy)
+
+    def toggle_simulation(self, enabled):
+        state = "开启" if enabled else "关闭"
+        self.set_busy(self.worker is not None)
+        self.append_log(f"模拟模式已{state}。", level="system")
 
     def destination_path(self):
         destination = self.destination.text().strip()
@@ -485,7 +530,7 @@ class WaveformWindow(W.QMainWindow):
         self.start_evaluation(FileEvaluationSettings(source, destination, thresholds))
 
     def start_run(self, *, single):
-        if self.worker is not None:
+        if self.worker is not None or not self.simulation_toggle.isChecked():
             return
         try:
             settings = self.run_settings(single)
@@ -499,7 +544,6 @@ class WaveformWindow(W.QMainWindow):
         self.clear_measurement()
         self.progress.setMaximum(settings.count)
         file_mode = isinstance(settings, FileEvaluationSettings)
-        self.mode.setText("文件评价" if file_mode else "模拟模式")
         if file_mode:
             source = settings.source_file
             name = self.condition.fontMetrics().elidedText(source.name, Qt.TextElideMode.ElideMiddle, 190)
@@ -509,7 +553,7 @@ class WaveformWindow(W.QMainWindow):
             self.set_verdict("评价中")
             self.append_log(f"打开波形文件  {source}", level="system")
         else:
-            self.progress_label.setText(f"0 / {settings.count} 个工况")
+            self.progress_label.setText(f"模拟 0 / {settings.count} 个工况")
             self.set_verdict("采集中")
             if settings.count == 1:
                 self.append_log("开始模拟评价，共 1 个工况。", level="system")
@@ -567,7 +611,7 @@ class WaveformWindow(W.QMainWindow):
             self.progress_label.setText("文件评价完成")
             self.append_log("文件评价完成，已保存结果。")
         else:
-            self.progress_label.setText(f"已完成  {outcome.saved} / {worker.settings.count}")
+            self.progress_label.setText(f"模拟完成  {outcome.saved} / {worker.settings.count}")
             self.append_log(f"流程完成，已保存 {outcome.saved} 个工况。")
         self.set_busy(False)
         if self.closing:
@@ -637,7 +681,7 @@ class WaveformWindow(W.QMainWindow):
         self.progress.setValue(measurement.index)
         if not file_mode:
             self.condition.setText(point)
-            self.progress_label.setText(f"{measurement.index} / {self.worker.settings.count} 个工况")
+            self.progress_label.setText(f"模拟 {measurement.index} / {self.worker.settings.count} 个工况")
         self.set_verdict(verdict, state)
         self.alignment_value.setText(aligned_value)
         self.raw_value.setText(raw_value)

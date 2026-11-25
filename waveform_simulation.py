@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+from functools import cache
 from ipaddress import ip_address
 from itertools import product
 import json
@@ -20,6 +21,8 @@ DEFAULT_FREQUENCY = (80, 200, 20)
 DEFAULT_WIDTH = (100, 800, 100)
 DEFAULT_RAW_LIMIT = 20.0
 MAX_CAPTURE_SAMPLES = 1_000_000
+TEMPLATE_INTERVAL_NS = 0.2
+TEMPLATE_PATH = Path(__file__).with_name("waveform_core") / "data" / "simulation_pulses.npz"
 
 
 def scan_axis(start, end, step, label):
@@ -30,7 +33,7 @@ def scan_axis(start, end, step, label):
 
 def capture_grid(frequency_khz, width_ns):
     period_ns = 1_000_000 / frequency_khz
-    interval_ns = min(0.2, width_ns / 500)
+    interval_ns = min(TEMPLATE_INTERVAL_NS, width_ns / 500)
     return period_ns, interval_ns, ceil((2 * period_ns + 3 * width_ns) / interval_ns)
 
 
@@ -111,18 +114,52 @@ class SimulationOutcome:
     condition: tuple[int, int] | None = None
 
 
+@cache
+def _measured_pulses():
+    """Load the bundled raw pulse excerpts, grouped by source condition."""
+    pulses = {}
+    with np.load(TEMPLATE_PATH, allow_pickle=False) as data:
+        voltage = data["voltage_v"]
+        offsets = data["offsets"]
+        for point, start, stop, rise, width in zip(
+                data["points"], offsets[:-1], offsets[1:], data["rise_samples"], data["width50_ns"],
+                strict=True):
+            pulses.setdefault(tuple(map(int, point)), []).append((voltage[start:stop], rise, width))
+    return pulses
+
+
 def simulate_capture(frequency_khz, width_ns, seed):
+    """Replay measured pulse shapes at the requested repetition rate."""
     period_ns, interval_ns, count = capture_grid(frequency_khz, width_ns)
     t = -width_ns + np.arange(count) * interval_ns
+    templates = _measured_pulses()
+    source_point = min(templates, key=lambda point: (abs(point[0] - frequency_khz),
+                                                     abs(point[1] - width_ns), point))
+    source_pulses = templates[source_point]
     rng = np.random.default_rng(seed)
-    voltage = rng.normal(0, 0.0002, count)
-    ramp_ns = min(7.0, 0.07 * width_ns)
-    dip = (0.0, -0.10, -0.24)[(frequency_khz // 20 + width_ns // 100 + 1) % 3]
-    for cycle in range(3):
-        local_time = t - cycle * period_ns
-        profile = np.clip(np.minimum(local_time, width_ns - local_time) / ramp_ns, 0, 1)
-        distortion = dip * np.exp(-0.5 * ((local_time / width_ns - 0.51) / 0.087) ** 2)
-        voltage += profile * (1 + distortion)
+    first = rng.integers(max(1, len(source_pulses) - 2))
+    pulses = [source_pulses[(first + i) % len(source_pulses)] for i in range(3)]
+    # The first 20 ns of each excerpt is sampled from the scope's low state.
+    baseline = np.concatenate([samples[:100] for samples, _, _ in pulses])
+    voltage = rng.choice(baseline, size=count).astype(float)
+
+    for cycle, (samples, rise_sample, measured_width) in enumerate(pulses):
+        source_t = (np.arange(len(samples)) - rise_sample) * TEMPLATE_INTERVAL_NS
+        target_width = min(measured_width * (width_ns / source_point[1]), period_ns - interval_ns)
+        padding = (period_ns - target_width) / 2
+        pre = min(padding, -source_t[0])
+        post = min(padding, source_t[-1] - measured_width)
+        trigger = round((width_ns + cycle * period_ns) / interval_ns)
+        start = max(0, ceil(trigger - pre / interval_ns))
+        end = min(count, 1 + int(trigger + (target_width + post) / interval_ns))
+        local_t = (np.arange(start, end) - trigger) * interval_ns
+        # For a different width, stretch the interior and keep the two edge times.
+        edge = min(20.0, 0.2 * measured_width, 0.2 * target_width)
+        measured_t = np.interp(local_t,
+                               [source_t[0], edge, target_width - edge,
+                                target_width + source_t[-1] - measured_width],
+                               [source_t[0], edge, measured_width - edge, source_t[-1]])
+        voltage[start:end] = np.interp(measured_t, source_t, samples)
     return t * 1e-9, voltage
 
 

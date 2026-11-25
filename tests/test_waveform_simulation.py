@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from waveform_core.timing_pulses import prepare_timed_file
+from waveform_core.timing_pulses import prepare_timed_file, prepare_timed_waveform
 from waveform_simulation import (
     DEFAULT_FREQUENCY,
     DEFAULT_WIDTH,
@@ -33,6 +33,24 @@ def summary_for(outcome):
 
 
 class SimulationTests(unittest.TestCase):
+    def test_simulation_preserves_recorded_amplitude_width_and_noise(self):
+        time_s, voltage_v = simulate_capture(80, 100, seed=42)
+        record = prepare_timed_waveform(time_s, voltage_v, point=(80, 100))
+        self.assertEqual(len(record.pulses), 3)
+        self.assertGreater(np.std(voltage_v[time_s < -70e-9]), 0.01)
+        for pulse in record.pulses:
+            self.assertAlmostEqual(pulse["amplitude_v"], 1.6, delta=0.06)
+            self.assertAlmostEqual(pulse["width50_ns"], 95.0, delta=1.5)
+
+    def test_simulation_adapts_unmeasured_condition(self):
+        time_s, voltage_v = simulate_capture(200, 325, seed=42)
+        record = prepare_timed_waveform(time_s, voltage_v, point=(200, 325))
+        self.assertEqual(len(record.pulses), 3)
+        cadence = record.measurement_context["observed_cadence"]
+        self.assertAlmostEqual(cadence["observed_frequency_khz"], 200, delta=0.1)
+        for pulse in record.pulses:
+            self.assertAlmostEqual(pulse["width50_ns"], 322.0, delta=2.0)
+
     def test_axis_step_and_invalid_configuration(self):
         self.assertEqual(list(scan_axis(80, 125, 20, "重频")), [80, 100, 120])
         for args in ((0, 100, 20), (100, 80, 20), (80, 100, 0)):
