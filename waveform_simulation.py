@@ -1,4 +1,4 @@
-"""Evaluate and save generated captures or waveform files for the desktop frontend."""
+"""Evaluate and save desktop waveforms from simulation, files or the scope."""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +13,7 @@ from tempfile import NamedTemporaryFile, mkdtemp
 import numpy as np
 
 from fiber1100_algorithm import evaluate_shape_record
+from scope_capture import SCOPE_CHANNEL, ScopeFrame
 from waveform_core.timing_pulses import prepare_timed_waveform
 from waveform_core.waveform_io import load_waveform
 
@@ -82,6 +83,17 @@ class FileEvaluationSettings:
     source_file: Path
     destination: Path
     thresholds: dict[str, float]
+
+    count = 1
+
+
+@dataclass(frozen=True)
+class ScopeEvaluationSettings:
+    frame: ScopeFrame
+    destination: Path
+    thresholds: dict[str, float]
+    scope_ip: str
+    scope_identity: str
 
     count = 1
 
@@ -184,24 +196,29 @@ def run_simulation(settings, cancelled, on_started, on_measurement, *, interval_
     return run_evaluation(settings, cancelled, on_started, on_measurement, interval_s=interval_s)
 
 
-def run_evaluation(settings: SimulationSettings | FileEvaluationSettings,
+def run_evaluation(settings: SimulationSettings | FileEvaluationSettings | ScopeEvaluationSettings,
                    cancelled, on_started, on_measurement, *, interval_s=0.20):
     """Read, evaluate and save in the calling thread, publishing only saved captures."""
     directory = condition = None
     entries = []
     status = "running"
     error = ""
+    simulated = isinstance(settings, SimulationSettings)
     source_file = settings.source_file if isinstance(settings, FileEvaluationSettings) else None
     now = datetime.now().astimezone()
     summary = dict(status=status, started_at=now.isoformat(), thresholds=settings.thresholds,
                    total=settings.count, measurements=entries)
-    if source_file is None:
+    if simulated:
         summary.update(mode="simulation", scope_ip=settings.scope_ip, board_port=settings.board_port)
         for name, axis in (("frequency_khz", settings.frequencies), ("width_ns", settings.widths)):
             summary[name] = dict(start=axis.start, end=axis.stop - 1, step=axis.step)
         conditions = product(settings.frequencies, settings.widths)
     else:
-        summary.update(mode="file", source_file=str(source_file))
+        if source_file is not None:
+            summary.update(mode="file", source_file=str(source_file))
+        else:
+            summary.update(mode="scope", scope_ip=settings.scope_ip, scope_identity=settings.scope_identity,
+                           channel=SCOPE_CHANNEL, frame_received_at=settings.frame.received_at.isoformat())
         conditions = (None,)
     try:
         settings.destination.mkdir(parents=True, exist_ok=True)
@@ -214,7 +231,7 @@ def run_evaluation(settings: SimulationSettings | FileEvaluationSettings,
                 status = "stopped"
                 break
             condition = point
-            if source_file is None:
+            if simulated:
                 frequency, width = condition
                 time_s, voltage_v = simulate_capture(frequency, width, int(rng.integers(2**32)))
                 record = prepare_timed_waveform(time_s, voltage_v, point=condition)
@@ -222,11 +239,17 @@ def run_evaluation(settings: SimulationSettings | FileEvaluationSettings,
                 source_fields = dict(frequency_khz=frequency, width_ns=width)
             else:
                 frequency = width = None
-                time_s, voltage_v, interval = load_waveform(source_file)
+                if source_file is not None:
+                    time_s, voltage_v, interval = load_waveform(source_file)
+                    filename = "0001_导入波形.npz"
+                    source_fields = dict(source_file=str(source_file))
+                else:
+                    frame = settings.frame
+                    time_s, voltage_v, interval = frame.time_s, frame.voltage_v, frame.sample_interval_s
+                    filename = "0001_实测波形.npz"
+                    source_fields = {}
                 record = prepare_timed_waveform(time_s, voltage_v, sample_interval_s=interval,
                                                 path=source_file)
-                filename = "0001_导入波形.npz"
-                source_fields = dict(source_file=str(source_file))
             report = evaluate_shape_record(record, **settings.thresholds)
             if cancelled.is_set():
                 status = "stopped"

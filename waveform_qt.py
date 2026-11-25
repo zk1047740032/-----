@@ -3,22 +3,24 @@
 from datetime import datetime
 from ipaddress import ip_address
 from pathlib import Path
+import socket
 import sys
 from threading import Event
 
 import pyqtgraph as pg
-from PySide6.QtCore import QRectF, QStandardPaths, QThread, Qt, Signal
+from PySide6.QtCore import QRectF, QStandardPaths, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6 import QtWidgets as W
 from serial.tools.list_ports import comports
 
-from scope_probe import SCOPE_PORT, ScopeProbe
+from scope_capture import SCOPE_CHANNEL, SCOPE_PORT, SCOPE_TIMEOUT_S, ScopeConnection
 from waveform_core.reference_alignment import AXIS_LABELS, DEFAULT_ALIGNMENT_TOLERANCE_PCT
 from waveform_simulation import (
     DEFAULT_FREQUENCY,
     DEFAULT_RAW_LIMIT,
     DEFAULT_WIDTH,
     FileEvaluationSettings,
+    ScopeEvaluationSettings,
     SimulationSettings,
     run_evaluation,
     scan_axis,
@@ -150,12 +152,60 @@ class EvaluationThread(QThread):
                                      self.directory_ready.emit, self.measurement_ready.emit)
 
 
+class ScopeThread(QThread):
+    identified = Signal(str)
+
+    def __init__(self, address, live, parent):
+        super().__init__(parent)
+        self.address = address
+        self.live = live
+        self.cancelled = Event()
+        self.connection = None
+        self.identity = ""
+        self.latest_frame = None
+        self.error = ""
+
+    def run(self):
+        try:
+            with socket.create_connection((self.address, SCOPE_PORT), timeout=SCOPE_TIMEOUT_S) as connection:
+                self.connection = connection
+                if self.cancelled.is_set():
+                    return
+                with connection.makefile("rb") as stream:
+                    scope = ScopeConnection(connection, stream)
+                    self.identity = scope.identify()
+                    self.identified.emit(self.identity)
+                    if not self.live or self.cancelled.is_set():
+                        return
+                    scope.configure_waveform()
+                    while not self.cancelled.is_set():
+                        self.latest_frame = scope.read_frame()
+                        self.cancelled.wait(0.25)
+        except (OSError, ValueError) as error:
+            if not self.cancelled.is_set():
+                self.error = str(error) or type(error).__name__
+        finally:
+            self.connection = None
+
+    def stop(self):
+        self.cancelled.set()
+        connection = self.connection
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
 class WaveformWindow(W.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("方波自动化 · 波形评价")
         self.worker = None
-        self.scope_probe = None
+        self.scope_thread = None
+        self.scope_refresh = QTimer(self, interval=100)
+        self.scope_refresh.timeout.connect(self.refresh_scope_frame)
+        self.scope_frozen = False
         self.closing = False
         self.waveform_directory = ""
         self.setStyleSheet(STYLE)
@@ -171,7 +221,7 @@ class WaveformWindow(W.QMainWindow):
         header.addStretch()
         header.addWidget(label("模拟模式", "section"))
         self.simulation_toggle = SimulationSwitch()
-        self.simulation_toggle.setToolTip("控制「开始」和「单次评价」是否可用。")
+        self.simulation_toggle.setToolTip("关闭模拟模式后可连接示波器，实时显示并单次评价。")
         self.simulation_toggle.toggled.connect(self.toggle_simulation)
         header.addWidget(self.simulation_toggle)
         root.addLayout(header)
@@ -194,8 +244,8 @@ class WaveformWindow(W.QMainWindow):
         screen = self.screen().availableGeometry()
         self.resize(min(1240, screen.width() - 36), min(790, screen.height() - 52))
         self.clear_measurement()
-        self.set_busy(False)
-        self.append_log("可开始模拟采集或打开波形文件。")
+        self.update_controls()
+        self.append_log("可开始模拟采集、打开波形文件，或关闭模拟模式后连接示波器。")
 
     def build_controls(self):
         panel = card()
@@ -222,11 +272,9 @@ class WaveformWindow(W.QMainWindow):
         connection.setVerticalSpacing(6)
         self.scope_ip = W.QLineEdit(placeholderText="例如 192.168.1.10")
         self.scope_ip.setAccessibleName("示波器 IP")
-        self.scope_check_button = W.QPushButton("连接")
-        self.scope_check_button.setAccessibleName("连接示波器")
-        self.scope_check_button.setToolTip(f"通过 TCP {SCOPE_PORT} 连接示波器并查询型号。")
-        self.scope_check_button.clicked.connect(self.check_scope)
-        connection.addRow("示波器 IP", self.field_with_button(self.scope_ip, self.scope_check_button))
+        self.scope_button = W.QPushButton("连接")
+        self.scope_button.clicked.connect(self.connect_scope)
+        connection.addRow("示波器 IP", self.field_with_button(self.scope_ip, self.scope_button))
         self.board_port = W.QComboBox()
         self.board_port.setAccessibleName("脉冲板口")
         self.board_port.setMinimumWidth(0)
@@ -283,7 +331,7 @@ class WaveformWindow(W.QMainWindow):
         self.stop_button.setObjectName("stopButton")
         self.stop_button.clicked.connect(self.stop_run)
         self.single_button = W.QPushButton("单次评价")
-        self.single_button.clicked.connect(lambda: self.start_run(single=True))
+        self.single_button.clicked.connect(self.single_evaluation)
         for button in (self.start_button, self.stop_button, self.single_button):
             actions.addWidget(button, 1)
         layout.addLayout(actions)
@@ -333,7 +381,6 @@ class WaveformWindow(W.QMainWindow):
         frame.setSpacing(4)
         self.plot = pg.PlotWidget(background="#ffffff")
         self.plot.setMinimumSize(0, 140)
-        self.plot.setLabel("bottom", "相对上升 50% 交点", units="ns", color="#6b7280")
         self.plot.setLabel("left", "电压", units="V", color="#6b7280")
         self.plot.showGrid(x=True, y=True, alpha=0.22)
         self.plot.hideButtons()
@@ -344,9 +391,12 @@ class WaveformWindow(W.QMainWindow):
             item.enableAutoSIPrefix(False)
         frame.addWidget(self.plot, 1)
         legend_row = W.QHBoxLayout()
-        legend = label("保持期 · 红区 y0–y2 · 蓝区参考", "muted")
-        legend.setWordWrap(True)
-        legend_row.addWidget(legend, 1)
+        self.window_legend = label("保持期 · 红区 y0–y2 · 蓝区参考", "muted")
+        legend_policy = self.window_legend.sizePolicy()
+        legend_policy.setRetainSizeWhenHidden(True)
+        self.window_legend.setSizePolicy(legend_policy)
+        self.window_legend.setWordWrap(True)
+        legend_row.addWidget(self.window_legend, 1)
         self.zoom_button = W.QPushButton("重置缩放")
         self.zoom_button.clicked.connect(self.reset_zoom)
         legend_row.addWidget(self.zoom_button)
@@ -430,8 +480,10 @@ class WaveformWindow(W.QMainWindow):
         if following:
             scrollbar.setValue(scrollbar.maximum())
 
-    def check_scope(self):
-        if self.scope_probe is not None:
+    def connect_scope(self):
+        if self.scope_thread is not None:
+            if self.scope_thread.live:
+                self.disconnect_scope()
             return
         try:
             address = str(ip_address(self.scope_ip.text().strip()))
@@ -440,24 +492,77 @@ class WaveformWindow(W.QMainWindow):
             self.scope_ip.setFocus()
             return
 
-        self.scope_ip.setEnabled(False)
-        self.scope_check_button.setEnabled(False)
+        scope = ScopeThread(address, live=not self.simulation_toggle.isChecked(), parent=self)
+        self.scope_thread = scope
+        if scope.live:
+            self.scope_frozen = False
+            self.clear_measurement()
+            self.condition.setText(SCOPE_CHANNEL)
+            self.condition.setToolTip(address)
+            self.progress_label.setText("正在连接示波器…")
+            self.scope_refresh.start()
         self.append_log(f"正在连接示波器 {address}（TCP {SCOPE_PORT}）。", level="system")
-        probe = ScopeProbe(address, self)
-        self.scope_probe = probe
-        probe.finished.connect(self.finish_scope_check)
-        probe.start()
+        scope.identified.connect(self.show_scope_identity)
+        scope.finished.connect(self.finish_scope_connection)
+        self.update_controls()
+        scope.start()
 
-    def finish_scope_check(self, success, detail):
-        probe = self.scope_probe
-        self.scope_probe = None
-        probe.deleteLater()
-        self.scope_ip.setEnabled(True)
-        self.scope_check_button.setEnabled(True)
-        if success:
-            self.append_log(f"示波器 {probe.address} 通信正常。{detail}", level="success")
-        else:
-            self.append_log(f"示波器 {probe.address} 通信失败。{detail}", level="error")
+    def show_scope_identity(self, identity):
+        scope = self.scope_thread
+        if scope.cancelled.is_set():
+            return
+        self.append_log(f"示波器 {scope.address} 通信正常。{identity}", level="success")
+        if scope.live and self.displayed_frame is None:
+            self.progress_label.setText(f"等待 {SCOPE_CHANNEL} 波形…")
+
+    def disconnect_scope(self):
+        scope = self.scope_thread
+        scope.stop()
+        self.scope_refresh.stop()
+        if scope.live:
+            self.scope_frozen = False
+            self.clear_measurement()
+            self.progress_label.setText("已断开示波器")
+            self.append_log(f"已断开示波器 {scope.address}。", level="system")
+        self.update_controls()
+
+    def finish_scope_connection(self):
+        scope = self.scope_thread
+        self.scope_thread = None
+        self.scope_refresh.stop()
+        scope.deleteLater()
+        if scope.error and not scope.cancelled.is_set():
+            self.append_log(f"示波器 {scope.address} 连接或读取失败。{scope.error}", level="error")
+            if scope.live and not self.scope_frozen:
+                self.clear_measurement()
+                self.progress_label.setText("示波器读取中断" if scope.identity else "连接失败")
+        self.update_controls()
+        if self.closing:
+            self.close()
+
+    def refresh_scope_frame(self):
+        scope = self.scope_thread
+        if self.scope_frozen or scope is None or scope.cancelled.is_set():
+            return
+        frame = scope.latest_frame
+        if frame is None or frame is self.displayed_frame:
+            return
+        first_frame = self.displayed_frame is None
+        if self.scope_curve is None:
+            self.plot.setLabel("bottom", "相对触发时刻", units="ns", color="#6b7280")
+            self.window_legend.hide()
+            self.scope_curve = self.plot.plot(pen=pg.mkPen("#2563eb", width=2), clipToView=True,
+                                              autoDownsample=True, downsampleMethod="peak")
+            self.plot.enableAutoRange()
+            self.zoom_button.setEnabled(True)
+        self.scope_curve.setData(frame.time_s * 1e9, frame.voltage_v)
+        self.displayed_frame = frame
+        received = frame.received_at.strftime("%H:%M:%S.%f")[:-3]
+        self.condition.setText(f"{SCOPE_CHANNEL} · {received}")
+        if first_frame:
+            self.progress_label.setText("实时显示")
+            self.set_verdict("待评价")
+            self.update_controls()
 
     def refresh_ports(self):
         saved = self.board_port.currentData()
@@ -480,18 +585,37 @@ class WaveformWindow(W.QMainWindow):
         if directory:
             self.destination.setText(str(Path(directory)))
 
-    def set_busy(self, busy):
-        can_simulate = not busy and self.simulation_toggle.isChecked()
+    def update_controls(self):
+        busy = self.worker is not None
+        available = not busy and not self.closing
+        simulated = self.simulation_toggle.isChecked()
+        scope = self.scope_thread
+        preview = scope is not None and scope.live and not scope.cancelled.is_set()
+        can_freeze = preview and self.displayed_frame is not None
+        can_resume = self.scope_frozen and not self.closing
         self.form.setEnabled(not busy)
-        self.simulation_toggle.setEnabled(not busy)
-        self.start_button.setEnabled(can_simulate)
-        self.single_button.setEnabled(can_simulate)
-        self.open_button.setEnabled(not busy)
-        self.stop_button.setEnabled(busy)
+        self.simulation_toggle.setEnabled(available)
+        self.scope_ip.setEnabled(scope is None)
+        self.scope_button.setText("断开" if preview else "连接")
+        self.scope_button.setAccessibleName("断开示波器" if preview else "连接示波器")
+        action = "查询型号" if simulated else f"实时读取 {SCOPE_CHANNEL} 波形"
+        self.scope_button.setToolTip("断开示波器连接。" if preview else f"通过 TCP {SCOPE_PORT} {action}。")
+        self.scope_button.setEnabled(available and (scope is None or preview))
+        self.start_button.setEnabled(available and simulated)
+        self.single_button.setText("恢复" if self.scope_frozen else "单次评价")
+        self.single_button.setEnabled(can_resume or (available and (simulated or can_freeze)))
+        self.open_button.setEnabled(available)
+        self.stop_button.setEnabled(busy and not self.worker.cancelled.is_set())
 
     def toggle_simulation(self, enabled):
+        if self.scope_thread is not None:
+            self.disconnect_scope()
+        elif self.scope_frozen:
+            self.scope_frozen = False
+            self.clear_measurement()
+            self.progress_label.setText("空闲")
         state = "开启" if enabled else "关闭"
-        self.set_busy(self.worker is not None)
+        self.update_controls()
         self.append_log(f"模拟模式已{state}。", level="system")
 
     def destination_path(self):
@@ -499,6 +623,9 @@ class WaveformWindow(W.QMainWindow):
         if not destination:
             raise ValueError("请选择保存目录。")
         return Path(destination).expanduser().resolve()
+
+    def evaluation_thresholds(self):
+        return dict(alignment_tolerance_pct=self.alignment.value(), raw_limit_pct=self.raw_limit.value())
 
     def run_settings(self, single):
         def axis(widgets, name):
@@ -518,7 +645,8 @@ class WaveformWindow(W.QMainWindow):
             destination = self.destination_path()
         except (OSError, ValueError) as error:
             self.append_log(f"参数有误。{error}", level="warning")
-            self.progress_label.setText("请检查参数")
+            if self.displayed_frame is None:
+                self.progress_label.setText("请检查参数")
             return
         selected, _ = W.QFileDialog.getOpenFileName(
             self, "打开波形文件", self.waveform_directory, "波形文件 (*.csv *.npz)")
@@ -526,8 +654,37 @@ class WaveformWindow(W.QMainWindow):
             return
         source = Path(selected)
         self.waveform_directory = str(source.parent)
-        thresholds = dict(alignment_tolerance_pct=self.alignment.value(), raw_limit_pct=self.raw_limit.value())
-        self.start_evaluation(FileEvaluationSettings(source, destination, thresholds))
+        if self.scope_thread is not None and self.scope_thread.live:
+            self.disconnect_scope()
+        self.start_evaluation(FileEvaluationSettings(source, destination, self.evaluation_thresholds()))
+
+    def single_evaluation(self):
+        if self.scope_frozen:
+            self.scope_frozen = False
+            if self.scope_thread is None:
+                self.clear_measurement()
+                self.progress_label.setText("请连接示波器")
+            else:
+                self.clear_evaluation()
+                self.displayed_frame = None
+                self.refresh_scope_frame()
+            self.update_controls()
+            return
+        if self.simulation_toggle.isChecked():
+            self.start_run(single=True)
+            return
+        scope = self.scope_thread
+        frame = self.displayed_frame
+        if self.worker is not None or frame is None or scope is None or scope.cancelled.is_set():
+            return
+        try:
+            destination = self.destination_path()
+        except (OSError, ValueError) as error:
+            self.append_log(f"参数有误。{error}", level="warning")
+            return
+        self.scope_frozen = True
+        self.start_evaluation(ScopeEvaluationSettings(frame, destination, self.evaluation_thresholds(),
+                                                      scope.address, scope.identity))
 
     def start_run(self, *, single):
         if self.worker is not None or not self.simulation_toggle.isChecked():
@@ -541,10 +698,18 @@ class WaveformWindow(W.QMainWindow):
         self.start_evaluation(settings)
 
     def start_evaluation(self, settings):
-        self.clear_measurement()
+        scope_mode = isinstance(settings, ScopeEvaluationSettings)
+        if scope_mode:
+            self.clear_evaluation()
+        else:
+            self.scope_frozen = False
+            self.clear_measurement()
         self.progress.setMaximum(settings.count)
-        file_mode = isinstance(settings, FileEvaluationSettings)
-        if file_mode:
+        if scope_mode:
+            self.progress_label.setText("已固定 · 评价中…")
+            self.set_verdict("评价中")
+            self.append_log(f"固定 {self.condition.text()} 波形并评价。", level="system")
+        elif isinstance(settings, FileEvaluationSettings):
             source = settings.source_file
             name = self.condition.fontMetrics().elidedText(source.name, Qt.TextElideMode.ElideMiddle, 190)
             self.condition.setText(name)
@@ -562,12 +727,12 @@ class WaveformWindow(W.QMainWindow):
         thresholds = settings.thresholds
         self.alignment_limit.setText(f"允许 ±{thresholds['alignment_tolerance_pct']:g}%")
         self.raw_threshold.setText(f"要求 <{thresholds['raw_limit_pct']:g}%")
-        self.set_busy(True)
         worker = EvaluationThread(settings, self)
         self.worker = worker
         worker.directory_ready.connect(self.show_directory)
         worker.measurement_ready.connect(self.show_measurement)
         worker.finished.connect(self.finish_run)
+        self.update_controls()
         worker.start()
 
     def show_directory(self, directory):
@@ -578,7 +743,8 @@ class WaveformWindow(W.QMainWindow):
             return
         self.worker.cancelled.set()
         self.stop_button.setEnabled(False)
-        self.progress_label.setText("正在停止…")
+        if self.scope_frozen or not isinstance(self.worker.settings, ScopeEvaluationSettings):
+            self.progress_label.setText("正在停止…")
         self.append_log("已请求停止，等待当前操作结束。", level="warning")
 
     def finish_run(self):
@@ -588,6 +754,12 @@ class WaveformWindow(W.QMainWindow):
         stopped = worker.cancelled.is_set()
         self.worker = None
         worker.deleteLater()
+        if isinstance(worker.settings, ScopeEvaluationSettings):
+            self.finish_scope_evaluation(outcome, stopped)
+            self.update_controls()
+            if self.closing:
+                self.close()
+            return
         if stopped:
             self.clear_measurement()
         if outcome.status == "failed":
@@ -613,9 +785,27 @@ class WaveformWindow(W.QMainWindow):
         else:
             self.progress_label.setText(f"模拟完成  {outcome.saved} / {worker.settings.count}")
             self.append_log(f"流程完成，已保存 {outcome.saved} 个工况。")
-        self.set_busy(False)
+        self.update_controls()
         if self.closing:
             self.close()
+
+    def finish_scope_evaluation(self, outcome, stopped):
+        if outcome.status == "failed":
+            state = "评价失败"
+            self.append_log(f"实机单次评价失败。{outcome.error}", level="error")
+            if self.scope_frozen:
+                self.set_verdict("待复核", "review")
+                self.reason.setText(outcome.error)
+        elif stopped or outcome.status == "stopped":
+            state = "评价已停止"
+            self.append_log(f"实机单次评价已停止，已保存 {outcome.saved} 份结果。", level="warning")
+            if self.scope_frozen:
+                self.set_verdict("已停止")
+        else:
+            state = "评价完成"
+            self.append_log("实机单次评价完成，已保存结果。")
+        if self.scope_frozen:
+            self.progress_label.setText(f"已固定 · {state}")
 
     def set_verdict(self, text, state=""):
         self.verdict.setText(text)
@@ -650,11 +840,18 @@ class WaveformWindow(W.QMainWindow):
 
     def clear_measurement(self):
         self.plot.clear()
+        self.plot.setLabel("bottom", "相对上升 50% 交点", units="ns", color="#6b7280")
         self.plot.setRange(xRange=(0, 100), yRange=(0, 1), padding=0)
+        self.scope_curve = None
+        self.displayed_frame = None
+        self.window_legend.show()
         self.zoom_button.setEnabled(False)
-        self.progress.setValue(0)
         self.condition.clear()
         self.condition.setToolTip("")
+        self.clear_evaluation()
+
+    def clear_evaluation(self):
+        self.progress.setValue(0)
         self.set_verdict("待采集")
         self.show_axis_advice()
         for value in (self.alignment_value, self.raw_value):
@@ -665,9 +862,15 @@ class WaveformWindow(W.QMainWindow):
     def show_measurement(self, measurement):
         report = measurement.report
         shape, flatness = report["shape"], report["flatness"]
+        settings = self.worker.settings
+        scope_mode = isinstance(settings, ScopeEvaluationSettings)
         file_mode = measurement.source_file is not None
-        point = (measurement.source_file.name if file_mode
-                 else f"{measurement.frequency_khz} kHz · {measurement.width_ns} ns")
+        if scope_mode:
+            point = f"{SCOPE_CHANNEL} · {settings.frame.received_at:%H:%M:%S.%f}"[:-3]
+        elif file_mode:
+            point = measurement.source_file.name
+        else:
+            point = f"{measurement.frequency_khz} kHz · {measurement.width_ns} ns"
         alignment = shape["score_pct"]
         aligned_value = "—" if alignment is None else f"{alignment:.2f}%"
         raw_value = f"{flatness['raw_max_pct']:.2f}%"
@@ -676,21 +879,23 @@ class WaveformWindow(W.QMainWindow):
                         "待复核": ("review", "warning")}[verdict]
         self.append_log(f"{point}  {verdict}  红蓝 {aligned_value}  不平度 {raw_value}", level=level)
         self.append_log(f"已保存 {measurement.capture_path.name}", level="success")
-        if self.worker.cancelled.is_set():
+        if self.worker.cancelled.is_set() or (scope_mode and not self.scope_frozen):
             return
         self.progress.setValue(measurement.index)
-        if not file_mode:
+        if not (file_mode or scope_mode):
             self.condition.setText(point)
-            self.progress_label.setText(f"模拟 {measurement.index} / {self.worker.settings.count} 个工况")
+            self.progress_label.setText(f"模拟 {measurement.index} / {settings.count} 个工况")
         self.set_verdict(verdict, state)
         self.alignment_value.setText(aligned_value)
         self.raw_value.setText(raw_value)
         self.show_axis_advice(shape)
         pulse = measurement.pulse
-        self.pulse_caption.setText(f"{len(flatness['pulses'])} 个完整脉冲 · 图示第 {pulse['number']} 个")
+        pulse_count = f"{len(flatness['pulses'])} 个完整脉冲"
+        self.pulse_caption.setText(pulse_count if scope_mode else f"{pulse_count} · 图示第 {pulse['number']} 个")
         self.reason.setText("保持期不平度超限。" if shape["status"] == "flat" and not report["passed"]
                             else shape["reason"])
-        self.draw_pulse(pulse, report["window"])
+        if not scope_mode:
+            self.draw_pulse(pulse, report["window"])
 
     def draw_pulse(self, pulse, window):
         self.plot.clear()
@@ -715,16 +920,16 @@ class WaveformWindow(W.QMainWindow):
         self.reset_zoom()
 
     def closeEvent(self, event):
-        if self.scope_probe is not None:
-            self.scope_probe.stop()
-            self.scope_probe.deleteLater()
-            self.scope_probe = None
-        if self.worker is None:
+        if self.scope_thread is None and self.worker is None:
             super().closeEvent(event)
-        else:
-            self.closing = True
-            self.stop_run()
-            event.ignore()
+            return
+        self.closing = True
+        self.scope_refresh.stop()
+        if self.scope_thread is not None:
+            self.scope_thread.stop()
+        self.stop_run()
+        self.update_controls()
+        event.ignore()
 
 
 def main():
