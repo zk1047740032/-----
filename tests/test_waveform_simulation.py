@@ -3,7 +3,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 
@@ -57,9 +56,14 @@ class SimulationTests(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 scan_axis(*args, "重频")
         for fields in (dict(scope_ip="invalid"), dict(raw_limit_pct=0),
-                       dict(widths=range(5000, 5001)), dict(frequencies=range(1, 2))):
+                       dict(frequencies=range(1, 2), widths=range(100, 101))):
             with self.subTest(fields=fields), self.assertRaises(ValueError):
                 settings_for(".", **fields)
+        wide_pulse = range(5000, 5001)
+        with self.assertRaisesRegex(ValueError, "周期"):
+            settings_for(".", frequencies=range(200, 201), widths=wide_pulse)
+        valid = settings_for(".", frequencies=range(150, 151), widths=wide_pulse)
+        self.assertEqual(valid.widths, wide_pulse)
 
     def test_single_evaluates_and_saves_loadable_capture(self):
         with TemporaryDirectory() as temporary:
@@ -88,47 +92,48 @@ class SimulationTests(unittest.TestCase):
     def test_scan_steps_through_width_before_frequency_and_stops(self):
         with TemporaryDirectory() as temporary:
             settings = settings_for(temporary)
+            first_frequency, next_frequency = settings.frequencies[:2]
+            first_width = settings.widths[0]
+            expected = [(first_frequency, width) for width in settings.widths]
+            expected.append((next_frequency, first_width))
+            stop_after = len(expected)
             cancelled = Event()
             points = []
 
             def record_point(result):
                 points.append((result.frequency_khz, result.width_ns))
-                if len(points) == 9:
+                if len(points) == stop_after:
                     cancelled.set()
 
             outcome = run_simulation(settings, cancelled, lambda _: None, record_point, interval_s=0)
-            self.assertEqual(settings.count, 56)
-            self.assertEqual(points, [(80, width) for width in range(100, 801, 100)] + [(100, 100)])
-            self.assertEqual((outcome.status, outcome.saved), ("stopped", 9))
+            self.assertEqual(settings.count, len(settings.frequencies) * len(settings.widths))
+            self.assertEqual(points, expected)
+            self.assertEqual((outcome.status, outcome.saved), ("stopped", stop_after))
             self.assertEqual(summary_for(outcome)["status"], "stopped")
-            self.assertEqual(len(list(outcome.directory.glob("*.npz"))), 9)
-            restarted = settings_for(temporary, frequencies=range(80, 81), widths=range(100, 101))
+            self.assertEqual(len(list(outcome.directory.glob("*.npz"))), stop_after)
+            restarted = settings_for(temporary, frequencies=range(first_frequency, first_frequency + 1),
+                                     widths=range(first_width, first_width + 1))
             second = run_simulation(restarted, Event(), lambda _: None, lambda _: None, interval_s=0)
             self.assertEqual((second.status, second.saved), ("completed", 1))
             self.assertNotEqual(second.directory, outcome.directory)
 
     def test_save_error_keeps_previous_measurements(self):
         with TemporaryDirectory() as temporary:
-            def simulate(frequency, width, seed):
-                if width == 200:
-                    # A directory at this path makes the second capture replace fail.
-                    (directory / "0002_80kHz_200ns.npz").mkdir()
-                return simulate_capture(frequency, width, seed)
+            settings = settings_for(temporary, frequencies=range(50, 51), widths=range(100, 201, 50))
+            failed_condition = (50, 150)
+            blocked_filename = "0002_50kHz_150ns.npz"
 
-            def started(path):
-                nonlocal directory
-                directory = path
+            def block_second_capture(directory):
+                (directory / blocked_filename).mkdir()
 
-            directory = None
             results = []
-            with patch("waveform_simulation.simulate_capture", side_effect=simulate):
-                outcome = run_simulation(settings_for(temporary), Event(), started,
-                                         results.append, interval_s=0)
-            self.assertEqual((outcome.status, outcome.saved, outcome.condition), ("failed", 1, (80, 200)))
+            outcome = run_simulation(settings, Event(), block_second_capture, results.append, interval_s=0)
+            self.assertEqual((outcome.status, outcome.saved, outcome.condition), ("failed", 1, failed_condition))
+            self.assertIn(blocked_filename, outcome.error)
             self.assertEqual(len(results), 1)
             self.assertTrue(results[0].capture_path.is_file())
             summary = summary_for(outcome)
-            self.assertEqual(summary["failed_condition"], [80, 200])
+            self.assertEqual(summary["failed_condition"], list(failed_condition))
             self.assertEqual(len(summary["measurements"]), 1)
 
     def test_file_evaluation_uses_file_samples_and_current_thresholds(self):

@@ -8,11 +8,12 @@ import sys
 from threading import Event
 
 import pyqtgraph as pg
-from PySide6.QtCore import QRectF, QStandardPaths, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QEvent, QRectF, QStandardPaths, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6 import QtWidgets as W
 from serial.tools.list_ports import comports
 
+from pulse_board_port import PulseBoardPort
 from scope_capture import SCOPE_CHANNEL, SCOPE_PORT, SCOPE_TIMEOUT_S, ScopeConnection
 from waveform_core.reference_alignment import AXIS_LABELS, DEFAULT_ALIGNMENT_TOLERANCE_PCT
 from waveform_simulation import (
@@ -35,7 +36,6 @@ QFrame[card="true"] {
     background: #ffffff; border: 1px solid #e3e7ec; border-radius: 12px;
 }
 QLabel { background: transparent; }
-QLabel[role="title"] { color: #34495e; font-size: 24px; font-weight: 700; }
 QLabel[role="heading"] { color: #34495e; font-size: 16px; font-weight: 700; }
 QLabel[role="section"] { color: #2c3e50; font-weight: 700; }
 QLabel[role="muted"] { color: #6b7280; }
@@ -102,7 +102,6 @@ class SimulationSwitch(W.QAbstractButton):
     def __init__(self):
         super().__init__()
         self.setCheckable(True)
-        self.setChecked(True)
         self.setFixedSize(56, 36)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -197,12 +196,28 @@ class ScopeThread(QThread):
                 pass
 
 
+class BoardPortThread(QThread):
+    def __init__(self, port, parent):
+        super().__init__(parent)
+        self.port = port
+        self.connection = None
+        self.error = ""
+
+    def run(self):
+        try:
+            self.connection = PulseBoardPort(self.port)
+        except (OSError, ValueError) as error:
+            self.error = str(error)
+
+
 class WaveformWindow(W.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("方波自动化 · 波形评价")
+        self.setWindowTitle("方波自动化")
         self.worker = None
         self.scope_thread = None
+        self.board_thread = None
+        self.board_connection = None
         self.scope_refresh = QTimer(self, interval=100)
         self.scope_refresh.timeout.connect(self.refresh_scope_frame)
         self.scope_frozen = False
@@ -215,16 +230,6 @@ class WaveformWindow(W.QMainWindow):
         self.setCentralWidget(central)
         root = W.QVBoxLayout(central)
         root.setContentsMargins(18, 12, 18, 14)
-        root.setSpacing(10)
-        header = W.QHBoxLayout()
-        header.addWidget(label("方波自动化", "title"))
-        header.addStretch()
-        header.addWidget(label("模拟模式", "section"))
-        self.simulation_toggle = SimulationSwitch()
-        self.simulation_toggle.setToolTip("关闭模拟模式后可连接示波器，实时显示并单次评价。")
-        self.simulation_toggle.toggled.connect(self.toggle_simulation)
-        header.addWidget(self.simulation_toggle)
-        root.addLayout(header)
 
         splitter = W.QSplitter(Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
@@ -239,13 +244,13 @@ class WaveformWindow(W.QMainWindow):
         splitter.addWidget(self.build_log())
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
-        splitter.setSizes([530, 155])
+        splitter.setSizes([530, 197])
 
         screen = self.screen().availableGeometry()
         self.resize(min(1240, screen.width() - 36), min(790, screen.height() - 52))
         self.clear_measurement()
         self.update_controls()
-        self.append_log("可开始模拟采集、打开波形文件，或关闭模拟模式后连接示波器。")
+        self.append_log("可连接示波器、打开波形文件，或开启模拟模式。")
 
     def build_controls(self):
         panel = card()
@@ -253,7 +258,17 @@ class WaveformWindow(W.QMainWindow):
         layout = W.QVBoxLayout(panel)
         layout.setContentsMargins(13, 12, 13, 12)
         layout.setSpacing(8)
-        layout.addWidget(label("控制面板", "heading"))
+
+        header = W.QHBoxLayout()
+        header.addWidget(label("控制面板", "heading"))
+        header.addStretch()
+        header.addWidget(label("模拟", "section"))
+        self.simulation_toggle = SimulationSwitch()
+        self.simulation_toggle.setToolTip("关闭模拟模式后可连接示波器，实时显示并单次评价。")
+        self.simulation_toggle.toggled.connect(self.toggle_simulation)
+        header.addWidget(self.simulation_toggle)
+        layout.addLayout(header)
+
         scroll = W.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -274,21 +289,26 @@ class WaveformWindow(W.QMainWindow):
         self.scope_ip.setAccessibleName("示波器 IP")
         self.scope_button = W.QPushButton("连接")
         self.scope_button.clicked.connect(self.connect_scope)
-        connection.addRow("示波器 IP", self.field_with_button(self.scope_ip, self.scope_button))
+        connection.addRow("示波器 IP", self.field_with_buttons(self.scope_ip, self.scope_button))
         self.board_port = W.QComboBox()
         self.board_port.setAccessibleName("脉冲板口")
         self.board_port.setMinimumWidth(0)
         self.board_port.setSizePolicy(W.QSizePolicy.Policy.Ignored, W.QSizePolicy.Policy.Fixed)
-        refresh = W.QPushButton("刷新")
-        refresh.clicked.connect(self.refresh_ports)
-        connection.addRow("脉冲板口", self.field_with_button(self.board_port, refresh))
+        self.board_port.addItem("未选择", "")
+        self.board_refresh_button = W.QPushButton("刷新")
+        self.board_refresh_button.setAccessibleName("刷新串口列表")
+        self.board_refresh_button.clicked.connect(self.refresh_ports)
+        self.board_button = W.QPushButton("连接")
+        self.board_button.clicked.connect(self.connect_board)
+        connection.addRow("脉冲板口", self.field_with_buttons(
+            self.board_port, self.board_refresh_button, self.board_button))
         self.refresh_ports()
         documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
         self.destination = W.QLineEdit(str((Path(documents) if documents else Path.home()) / "方波评价结果"))
         self.destination.setAccessibleName("保存地址")
         browse = W.QPushButton("浏览")
         browse.clicked.connect(self.choose_directory)
-        connection.addRow("保存地址", self.field_with_button(self.destination, browse))
+        connection.addRow("保存地址", self.field_with_buttons(self.destination, browse))
         fields.addLayout(connection)
 
         fields.addWidget(label("算法参数", "section"))
@@ -341,13 +361,14 @@ class WaveformWindow(W.QMainWindow):
         return panel
 
     @staticmethod
-    def field_with_button(field, button):
+    def field_with_buttons(field, *buttons):
         widget = W.QWidget()
         row = W.QHBoxLayout(widget)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(5)
         row.addWidget(field, 1)
-        row.addWidget(button)
+        for button in buttons:
+            row.addWidget(button)
         return widget
 
     @staticmethod
@@ -566,19 +587,64 @@ class WaveformWindow(W.QMainWindow):
 
     def refresh_ports(self):
         saved = self.board_port.currentData()
-        self.board_port.clear()
-        self.board_port.addItem("未选择", "")
         self.board_port.setToolTip("")
         try:
             ports = sorted(comports())
         except OSError as error:
             self.board_port.setToolTip(f"串口列表读取失败。{error}")
             return
+        self.board_port.clear()
+        self.board_port.addItem("未选择", "")
         for port in ports:
             self.board_port.addItem(port.device, port.device)
         previous = self.board_port.findData(saved)
         if previous >= 0:
             self.board_port.setCurrentIndex(previous)
+
+    def connect_board(self):
+        if self.board_thread is not None:
+            return
+        if self.board_connection is not None:
+            self.disconnect_board()
+            self.update_controls()
+            return
+        port = self.board_port.currentData()
+        if not port:
+            self.append_log("请先选择脉冲板串口。", level="warning")
+            self.board_port.setFocus()
+            return
+
+        self.append_log(f"正在打开脉冲板串口 {port}。", level="system")
+        thread = BoardPortThread(port, self)
+        self.board_thread = thread
+        thread.finished.connect(self.finish_board_connection)
+        self.update_controls()
+        thread.start()
+
+    def finish_board_connection(self):
+        thread = self.board_thread
+        self.board_thread = None
+        thread.deleteLater()
+        if thread.connection is None:
+            self.append_log(f"脉冲板串口 {thread.port} 打开失败。{thread.error}", level="error")
+        else:
+            self.board_connection = thread.connection
+            self.append_log(f"脉冲板串口 {thread.port} 已打开，板卡应答待验证。", level="success")
+        self.update_controls()
+        if self.closing:
+            self.close()
+
+    def disconnect_board(self):
+        connection = self.board_connection
+        if connection is None:
+            return
+        try:
+            connection.close()
+        except OSError as error:
+            self.append_log(f"关闭脉冲板串口 {connection.port} 失败。{error}", level="error")
+            return
+        self.board_connection = None
+        self.append_log(f"已关闭脉冲板串口 {connection.port}。", level="system")
 
     def choose_directory(self):
         directory = W.QFileDialog.getExistingDirectory(self, "选择结果保存目录", self.destination.text())
@@ -593,6 +659,8 @@ class WaveformWindow(W.QMainWindow):
         preview = scope is not None and scope.live and not scope.cancelled.is_set()
         can_freeze = preview and self.displayed_frame is not None
         can_resume = self.scope_frozen and not self.closing
+        board_ready = available and self.board_thread is None
+        board_connected = self.board_connection is not None
         self.form.setEnabled(not busy)
         self.simulation_toggle.setEnabled(available)
         self.scope_ip.setEnabled(scope is None)
@@ -601,6 +669,11 @@ class WaveformWindow(W.QMainWindow):
         action = "查询型号" if simulated else f"实时读取 {SCOPE_CHANNEL} 波形"
         self.scope_button.setToolTip("断开示波器连接。" if preview else f"通过 TCP {SCOPE_PORT} {action}。")
         self.scope_button.setEnabled(available and (scope is None or preview))
+        self.board_port.setEnabled(board_ready and not board_connected)
+        self.board_refresh_button.setEnabled(board_ready and not board_connected)
+        self.board_button.setEnabled(board_ready)
+        self.board_button.setText("断开" if board_connected else "连接")
+        self.board_button.setAccessibleName("断开脉冲板串口" if board_connected else "连接脉冲板串口")
         self.start_button.setEnabled(available and simulated)
         self.single_button.setText("恢复" if self.scope_frozen else "单次评价")
         self.single_button.setEnabled(can_resume or (available and (simulated or can_freeze)))
@@ -920,7 +993,8 @@ class WaveformWindow(W.QMainWindow):
         self.reset_zoom()
 
     def closeEvent(self, event):
-        if self.scope_thread is None and self.worker is None:
+        self.disconnect_board()
+        if self.scope_thread is None and self.worker is None and self.board_thread is None:
             super().closeEvent(event)
             return
         self.closing = True
@@ -937,9 +1011,13 @@ def main():
     app.setStyle("Fusion")
     app.styleHints().setColorScheme(Qt.ColorScheme.Light)
     app.setFont(QFont("Microsoft YaHei", 10))
+    app.setWindowIcon(QIcon(str(Path(__file__).resolve().with_name("PreciLasers-app.ico"))))
     window = WaveformWindow()
     window.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    window.deleteLater()
+    app.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
