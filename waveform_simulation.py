@@ -10,6 +10,7 @@ import numpy as np
 
 from fiber1100_algorithm import evaluate_shape_record
 from scope_capture import ScopeFrame
+from waveform_core.reference_alignment import validate_alignment_tolerance
 from waveform_core.timing_pulses import prepare_timed_waveform
 from waveform_core.waveform_io import load_waveform
 
@@ -38,12 +39,13 @@ def capture_grid(frequency_khz, width_ns):
 class SimulationSettings:
     frequencies: range
     widths: range
-    alignment_tolerance_pct: float
+    alignment_tolerance_pct: float | dict[str, float]
     raw_limit_pct: float
+    red_windows: dict[str, tuple[float, float]] | None = None
 
     def __post_init__(self):
-        if not isfinite(self.alignment_tolerance_pct) or self.alignment_tolerance_pct < 0:
-            raise ValueError("红蓝高度允许偏差须为非负的有限百分比。")
+        object.__setattr__(self, "alignment_tolerance_pct",
+                           validate_alignment_tolerance(self.alignment_tolerance_pct))
         if not isfinite(self.raw_limit_pct) or self.raw_limit_pct <= 0:
             raise ValueError("不平度上限须为大于 0 的有限百分比。")
         if not self.frequencies or not self.widths:
@@ -69,7 +71,8 @@ class SimulationSettings:
 @dataclass(frozen=True)
 class FileEvaluationSettings:
     source_file: Path
-    thresholds: dict[str, float]
+    thresholds: dict[str, float | dict[str, float]]
+    red_windows: dict[str, tuple[float, float]] | None = None
 
     count = 1
 
@@ -77,7 +80,8 @@ class FileEvaluationSettings:
 @dataclass(frozen=True)
 class ScopeEvaluationSettings:
     frame: ScopeFrame
-    thresholds: dict[str, float]
+    thresholds: dict[str, float | dict[str, float]]
+    red_windows: dict[str, tuple[float, float]] | None = None
 
     count = 1
 
@@ -190,7 +194,7 @@ def run_evaluation(settings: SimulationSettings | FileEvaluationSettings | Scope
                     time_s, voltage_v, interval = frame.time_s, frame.voltage_v, frame.sample_interval_s
                 record = prepare_timed_waveform(time_s, voltage_v, sample_interval_s=interval,
                                                 path=source_file)
-            report = evaluate_shape_record(record, **settings.thresholds)
+            report = evaluate_shape_record(record, red_windows=settings.red_windows, **settings.thresholds)
             if cancelled.is_set():
                 return SimulationOutcome("stopped", evaluated)
             pulse = next(pulse for pulse in record.pulses

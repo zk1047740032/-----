@@ -10,15 +10,16 @@ from threading import Event, Lock
 from time import monotonic
 
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QRectF, QStandardPaths, QThread, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QStandardPaths, QThread, Qt, Signal
 from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QIcon, QIntValidator, QPainter, QPen,
-                          QTextCharFormat, QTextCursor)
+                          QPolygonF, QTextCharFormat, QTextCursor)
 from PySide6 import QtWidgets as W
 from serial.tools.list_ports import comports
 
 from pulse_board_port import BOARD_BAUDRATE, SHAPE_INDEX_D, SHAPE_REGISTER_MAX, PulseBoardPort
 from scope_capture import SCOPE_CHANNEL, SCOPE_PORT, SCOPE_TIMEOUT_S, ScopeConnection
-from waveform_core.reference_alignment import AXIS_LABELS, DEFAULT_ALIGNMENT_TOLERANCE_PCT
+from waveform_core.reference_alignment import (ALIGNMENT_TOLERANCE_EPS, AXIS_LABELS,
+                                               DEFAULT_ALIGNMENT_TOLERANCE_PCT, OBSERVATION_WINDOWS)
 from waveform_simulation import (
     DEFAULT_FREQUENCY,
     DEFAULT_RAW_LIMIT,
@@ -33,12 +34,22 @@ from waveform_simulation import (
 
 PULSE_TIME_LABEL = "相对上升 50% 交点"
 PULSE_LEGEND = "保持期 · 红区 y0–y2 · 蓝区参考"
+PREVIEW_RED = "#b04a64"
+PREVIEW_BLUE = "#7c9fe9"
+EXAMPLE_PULSE = (
+    (-10, .08), (-4, .08), (-2, .22), (0, .50), (2, .77), (4, .90), (6, .95),
+    (8, .93), (10, .96), (12, .93), (16, .95), (20, .93), (24, .956),
+    (28, .94), (32, .966), (36, .94), (40, .956), (44, .934), (48, .948),
+    (52, .93), (56, .955), (60, .945), (64, .961), (68, .947), (72, .957),
+    (76, .938), (80, .947), (84, .933), (88, .941), (92, .897), (96, .84),
+    (98, .71), (100, .50), (102, .24), (104, .09), (110, .08),
+)
 
 
 STYLE = """
 QMainWindow { background: #f4f6f9; }
 QWidget { color: #2c3e50; font-size: 13px; }
-QWidget#controlFields { background: #ffffff; }
+QWidget#controlFields, QWidget#resultFields { background: #ffffff; }
 QFrame[card="true"] {
     background: #ffffff; border: 1px solid #e3e7ec; border-radius: 12px;
 }
@@ -46,7 +57,9 @@ QLabel { background: transparent; }
 QLabel[role="heading"] { color: #34495e; font-size: 16px; font-weight: 700; }
 QLabel[role="section"] { color: #2c3e50; font-weight: 700; }
 QLabel[role="muted"] { color: #6b7280; }
-QLabel[role="value"] { color: #34495e; font-size: 20px; font-weight: 700; }
+QLabel[role="error"] { color: #c0392b; }
+QLabel[role="value"] { color: #34495e; font-size: 14px; font-weight: 700; }
+QLabel[role="value"][state="fail"] { color: #c0392b; }
 QLabel[role="verdict"] {
     color: #6b7280; background: #eef0f1; border-radius: 9px; padding: 5px 10px;
     font-weight: 700;
@@ -81,6 +94,23 @@ QProgressBar::chunk { background: #2d6cdf; border-radius: 3px; }
 QPlainTextEdit { background: #ffffff; border: 1px solid #e3e7ec; border-radius: 7px; padding: 5px; }
 QScrollArea { background: transparent; border: none; }
 QSplitter::handle { background: #f4f6f9; height: 10px; }
+QDialog#redRegionDialog { background: #f1f4f8; }
+QDialog#redRegionDialog QFrame[card="true"] { border-color: #d1dcea; }
+QDialog#redRegionDialog QLabel[role="heading"] { color: #173450; }
+QFrame#redRegionFields { background: #f4f7fb; border: 1px solid #d1dcea; border-radius: 8px; }
+QFrame#redRegionPreviewRule { background: #2868d8; }
+QDialog#redRegionDialog QDoubleSpinBox { border-color: #cedbe9; border-radius: 7px; }
+QDialog#redRegionDialog QDoubleSpinBox:focus { border-color: #2868d8; }
+QDialog#redRegionDialog QDoubleSpinBox::up-button,
+QDialog#redRegionDialog QDoubleSpinBox::down-button {
+    subcontrol-origin: padding; width: 17px; border: none; background: transparent;
+}
+QDialog#redRegionDialog QDoubleSpinBox::up-button { subcontrol-position: top right; }
+QDialog#redRegionDialog QDoubleSpinBox::down-button { subcontrol-position: bottom right; }
+QDialog#redRegionDialog QDoubleSpinBox::up-button:hover,
+QDialog#redRegionDialog QDoubleSpinBox::down-button:hover { background: #e9f1fc; }
+QDialog#redRegionDialog QDoubleSpinBox::up-arrow,
+QDialog#redRegionDialog QDoubleSpinBox::down-arrow { width: 0px; height: 0px; image: none; }
 """
 
 LOG_COLORS = {
@@ -103,6 +133,38 @@ def card():
     frame = W.QFrame()
     frame.setProperty("card", True)
     return frame
+
+
+class AlgorithmParameterSpinBox(W.QDoubleSpinBox):
+    def __init__(self, value, *, minimum=0., maximum=999_999, suffix=""):
+        super().__init__(decimals=2, minimum=minimum, maximum=maximum,
+                         singleStep=0.5, value=value, suffix=suffix)
+        self.lineEdit().setTextMargins(8, 0, 2, 0)
+        self.setMinimumWidth(69)
+        self.setSizePolicy(W.QSizePolicy.Policy.Ignored, W.QSizePolicy.Policy.Fixed)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        option = W.QStyleOptionSpinBox()
+        self.initStyleOption(option)
+        control = W.QStyle.ComplexControl.CC_SpinBox
+        sub = W.QStyle.SubControl
+        steps = W.QAbstractSpinBox.StepEnabledFlag
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for button, direction, step in ((sub.SC_SpinBoxUp, -1, steps.StepUpEnabled),
+                                        (sub.SC_SpinBoxDown, 1, steps.StepDownEnabled)):
+            rect = self.style().subControlRect(control, option, button, self)
+            center = rect.center()
+            x, y = center.x(), center.y()
+            painter.setBrush(QColor("#667487" if self.isEnabled() and option.stepEnabled & step else "#b9c3cf"))
+            painter.drawPolygon(QPolygonF([
+                QPointF(x - 3.5, y - direction * 2.2),
+                QPointF(x + 3.5, y - direction * 2.2),
+                QPointF(x, y + direction * 2.2),
+            ]))
+        painter.end()
 
 
 class ScopeTimeAxis(pg.AxisItem):
@@ -307,6 +369,9 @@ class WaveformWindow(W.QMainWindow):
         self.scope_rendered = (None, None)
         self.closing = False
         self.waveform_directory = ""
+        self.red_windows = {axis: OBSERVATION_WINDOWS[axis] for axis in AXIS_LABELS}
+        self.red_tolerances_pct = dict.fromkeys(AXIS_LABELS, DEFAULT_ALIGNMENT_TOLERANCE_PCT)
+        self.raw_limit_pct = DEFAULT_RAW_LIMIT
         self.setStyleSheet(STYLE)
         self.setMinimumSize(820, 520)
 
@@ -396,15 +461,13 @@ class WaveformWindow(W.QMainWindow):
         connection.addRow("截图目录", self.field_with_buttons(self.screenshot_directory, browse))
         fields.addLayout(connection)
 
-        fields.addWidget(label("算法参数", "section"))
-        thresholds = W.QFormLayout()
-        thresholds.setHorizontalSpacing(9)
-        thresholds.setVerticalSpacing(6)
-        self.alignment = self.percentage(DEFAULT_ALIGNMENT_TOLERANCE_PCT, minimum=0.0)
-        self.raw_limit = self.percentage(DEFAULT_RAW_LIMIT, minimum=0.01)
-        thresholds.addRow("红蓝高度允许偏差 ±", self.alignment)
-        thresholds.addRow("原始不平度上限 <", self.raw_limit)
-        fields.addLayout(thresholds)
+        algorithm_header = W.QHBoxLayout()
+        algorithm_header.addWidget(label("算法参数", "section"))
+        algorithm_header.addStretch()
+        self.red_region_button = W.QPushButton("红区参数…")
+        self.red_region_button.clicked.connect(self.edit_red_parameters)
+        algorithm_header.addWidget(self.red_region_button)
+        fields.addLayout(algorithm_header)
 
         fields.addWidget(label("测试参数", "section"))
         test_grid = W.QGridLayout()
@@ -456,11 +519,172 @@ class WaveformWindow(W.QMainWindow):
             row.addWidget(button)
         return widget
 
-    @staticmethod
-    def percentage(default, minimum):
-        spin = W.QDoubleSpinBox(decimals=2, minimum=minimum, maximum=999_999,
-                               singleStep=0.5, value=default, suffix=" %")
-        return spin
+    def edit_red_parameters(self):
+        dialog = W.QDialog(self)
+        dialog.setWindowTitle("红区参数")
+        dialog.setObjectName("redRegionDialog")
+        layout = W.QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        panels = W.QHBoxLayout()
+        panels.setSpacing(10)
+        layout.addLayout(panels, 1)
+
+        editor = card()
+        editor_layout = W.QVBoxLayout(editor)
+        editor_layout.setContentsMargins(12, 11, 12, 11)
+        editor_layout.setSpacing(9)
+        editor_layout.addWidget(label("算法参数", "heading"))
+        table = W.QFrame()
+        table.setObjectName("redRegionFields")
+        table_layout = W.QVBoxLayout(table)
+        table_layout.setContentsMargins(9, 9, 9, 9)
+        table_layout.setSpacing(8)
+        table_layout.addWidget(label("红区参数", "section"))
+        editor_layout.addWidget(table)
+        editor_layout.addWidget(label("端点按半高宽填写，允许偏差相对蓝区。", "muted"))
+
+        raw_limit = AlgorithmParameterSpinBox(self.raw_limit_pct, minimum=0.01, suffix=" %")
+        raw_limit.setAccessibleName("原始不平度上限")
+        raw_limit.setFixedWidth(118)
+        raw_limit.setSizePolicy(W.QSizePolicy.Policy.Fixed, W.QSizePolicy.Policy.Fixed)
+        raw_row = W.QHBoxLayout()
+        raw_row.addWidget(label("原始不平度上限 <"))
+        raw_row.addStretch()
+        raw_row.addWidget(raw_limit)
+        editor_layout.addLayout(raw_row)
+        panels.addWidget(editor, 1)
+
+        grid = W.QGridLayout()
+        grid.setHorizontalSpacing(7)
+        grid.setVerticalSpacing(7)
+        headers = ("左端点", "右端点", "允许偏差")
+        grid.addWidget(label("红区", "muted"), 0, 0)
+        for column, title in enumerate(headers, 1):
+            unit = "（±%）" if column == 3 else "（%）"
+            grid.addWidget(label(f"{title}\n{unit}", "muted"), 0, column)
+            grid.setColumnStretch(column, 1)
+
+        inputs = {}
+        for row, (axis, name) in enumerate(AXIS_LABELS.items(), 1):
+            left, right = self.red_windows[axis]
+            spins = (AlgorithmParameterSpinBox(left * 100, maximum=100),
+                     AlgorithmParameterSpinBox(right * 100, maximum=100),
+                     AlgorithmParameterSpinBox(self.red_tolerances_pct[axis]))
+            axis_labels = W.QVBoxLayout()
+            axis_labels.setSpacing(0)
+            axis_labels.addWidget(label(axis, "section"))
+            axis_labels.addWidget(label(name, "muted"))
+            grid.addLayout(axis_labels, row, 0)
+            for column, (spin, title) in enumerate(zip(spins, headers, strict=True), 1):
+                spin.setAccessibleName(f"{axis} {title}")
+                grid.addWidget(spin, row, column)
+            inputs[axis] = spins
+        table_layout.addLayout(grid)
+        error = label("", "error")
+        error.hide()
+        editor_layout.addWidget(error)
+        editor_layout.addStretch()
+
+        preview, regions = self.build_red_region_preview()
+        panels.addWidget(preview, 1)
+
+        def update_preview():
+            for axis, (left, right, _) in inputs.items():
+                interval = (left.value(), right.value())
+                valid = interval[0] < interval[1]
+                regions[axis].setVisible(valid)
+                if valid:
+                    regions[axis].setRegion(interval)
+
+        for left, right, _ in inputs.values():
+            left.valueChanged.connect(update_preview)
+            right.valueChanged.connect(update_preview)
+        update_preview()
+
+        def apply():
+            windows, tolerances = {}, {}
+            for axis, (left, right, tolerance) in inputs.items():
+                if left.value() >= right.value():
+                    error.setText(f"{axis} 左端点须小于右端点。")
+                    error.show()
+                    left.setFocus()
+                    return
+                windows[axis] = (left.value() / 100, right.value() / 100)
+                tolerances[axis] = tolerance.value()
+            self.red_windows, self.red_tolerances_pct = windows, tolerances
+            self.raw_limit_pct = raw_limit.value()
+            dialog.accept()
+
+        standard = W.QDialogButtonBox.StandardButton
+        buttons = W.QDialogButtonBox(standard.Ok | standard.Cancel)
+        ok = buttons.button(standard.Ok)
+        ok.setText("确定")
+        ok.setProperty("primary", True)
+        buttons.button(standard.Cancel).setText("取消")
+        buttons.accepted.connect(apply)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(724, 418)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def build_red_region_preview(self):
+        panel = card()
+        layout = W.QVBoxLayout(panel)
+        layout.setContentsMargins(12, 11, 12, 11)
+        layout.setSpacing(8)
+        title = W.QHBoxLayout()
+        title.addWidget(label("波形预览", "heading"))
+        title.addStretch()
+        pulse = self.evaluated_pulse
+        title.addWidget(label("示例波形" if pulse is None else "代表脉冲", "muted"))
+        layout.addLayout(title)
+        rule = W.QFrame()
+        rule.setObjectName("redRegionPreviewRule")
+        rule.setFixedHeight(3)
+        layout.addWidget(rule)
+
+        plot = pg.PlotWidget(background="#ffffff")
+        plot.setMinimumSize(270, 225)
+        plot.setMouseEnabled(x=False, y=False)
+        plot.setMenuEnabled(False)
+        plot.hideButtons()
+        plot.showGrid(x=True, y=True, alpha=.23)
+        plot.getViewBox().setBorder(pg.mkPen("#d0dceb"))
+        for name in ("bottom", "left"):
+            axis = plot.getAxis(name)
+            axis.setPen("#a2b3c9")
+            axis.setTextPen("#49617e")
+            axis.setStyle(tickLength=0)
+            axis.enableAutoSIPrefix(False)
+        plot.getAxis("left").setStyle(showValues=False, maxTickLevel=0)
+        plot.getAxis("left").setWidth(1)
+        plot.getAxis("bottom").setTicks([[(part, f"{part}%") for part in range(0, 101, 25)]])
+        plot.setXRange(-9, 109, padding=0)
+        if pulse is None:
+            phase, voltage = zip(*EXAMPLE_PULSE)
+        else:
+            phase = pulse["time_ns"] * (100 / pulse["width50_ns"])
+            visible = (phase >= -12) & (phase <= 112)
+            phase, voltage = phase[visible], pulse["voltage_v"][visible]
+        plot.plot(phase, voltage, pen=pg.mkPen("#2868d8", width=2),
+                  antialias=True, autoDownsample=True, downsampleMethod="peak")
+        layout.addWidget(plot, 1)
+
+        regions = {}
+        for axis, interval in (self.red_windows | {"reference": OBSERVATION_WINDOWS["reference"]}).items():
+            edge = QColor(PREVIEW_BLUE if axis == "reference" else PREVIEW_RED)
+            fill = QColor(edge)
+            fill.setAlpha(60 if axis == "reference" else 39)
+            region = pg.LinearRegionItem(tuple(phase * 100 for phase in interval), movable=False,
+                                         brush=fill, pen=pg.mkPen(edge))
+            region.setZValue(-1)
+            plot.addItem(region, ignoreBounds=True)
+            regions[axis] = region
+        layout.addWidget(label(f'<span style="color:{PREVIEW_RED}">■</span> 红区 y0–y2'
+                               f'&nbsp;&nbsp;&nbsp; <span style="color:{PREVIEW_BLUE}">■</span> 蓝区参考', "muted"))
+        return panel, regions
 
     def build_waveform(self):
         panel = card()
@@ -515,6 +739,7 @@ class WaveformWindow(W.QMainWindow):
         metrics = W.QVBoxLayout()
         metrics.setContentsMargins(0, 3, 0, 2)
         metrics.setSpacing(5)
+        metrics.setSizeConstraint(W.QLayout.SizeConstraint.SetMinimumSize)
         self.pulse_caption = label("", "muted")
         self.pulse_caption.setWordWrap(True)
         self.verdict = label("待采集", "verdict")
@@ -524,17 +749,36 @@ class WaveformWindow(W.QMainWindow):
 
         values = W.QGridLayout()
         values.setHorizontalSpacing(9)
-        values.setVerticalSpacing(2)
-        values.addWidget(label("最大红蓝偏差", "muted"), 0, 0)
-        values.addWidget(label("最大原始不平度", "muted"), 0, 1)
-        self.alignment_value = label("—", "value")
+        values.setVerticalSpacing(3)
+        values.setColumnStretch(0, 1)
+        values.setColumnMinimumWidth(1, 54)
+        values.setColumnMinimumWidth(2, 51)
+        right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        for column, title in enumerate(("红蓝偏差", "最大值", "允许值")):
+            heading = label(title, "muted")
+            if column:
+                heading.setAlignment(right)
+            values.addWidget(heading, 0, column)
+        self.axis_readouts = {}
+        for row, axis in enumerate(AXIS_LABELS, 1):
+            values.addWidget(label(axis), row, 0)
+            score = label("—", "value")
+            score.setAccessibleName(f"{axis} 最大红蓝偏差")
+            score.setAlignment(right)
+            limit = label("—", "muted")
+            limit.setAccessibleName(f"{axis} 允许偏差")
+            limit.setAlignment(right)
+            values.addWidget(score, row, 1)
+            values.addWidget(limit, row, 2)
+            self.axis_readouts[axis] = (score, limit)
+        values.setRowMinimumHeight(4, 3)
+        values.addWidget(label("原始不平度", "muted"), 5, 0)
         self.raw_value = label("—", "value")
-        self.alignment_limit = label("", "muted")
-        self.raw_threshold = label("", "muted")
-        values.addWidget(self.alignment_value, 1, 0)
-        values.addWidget(self.raw_value, 1, 1)
-        values.addWidget(self.alignment_limit, 2, 0)
-        values.addWidget(self.raw_threshold, 2, 1)
+        self.raw_value.setAlignment(right)
+        self.raw_threshold = label("—", "muted")
+        self.raw_threshold.setAlignment(right)
+        values.addWidget(self.raw_value, 5, 1)
+        values.addWidget(self.raw_threshold, 5, 2)
         metrics.addLayout(values)
 
         metrics.addSpacing(4)
@@ -577,9 +821,14 @@ class WaveformWindow(W.QMainWindow):
         metrics.addWidget(self.set_y_button)
         metrics.addStretch()
         results = W.QWidget()
-        results.setFixedWidth(208)
+        results.setObjectName("resultFields")
         results.setLayout(metrics)
-        content.addWidget(results)
+        result_scroll = W.QScrollArea()
+        result_scroll.setFixedWidth(208)
+        result_scroll.setWidgetResizable(True)
+        result_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        result_scroll.setWidget(results)
+        content.addWidget(result_scroll)
         layout.addLayout(content, 1)
         return panel
 
@@ -847,7 +1096,7 @@ class WaveformWindow(W.QMainWindow):
         self.append_log(f"模拟模式已{state}。", level="system")
 
     def evaluation_thresholds(self):
-        return dict(alignment_tolerance_pct=self.alignment.value(), raw_limit_pct=self.raw_limit.value())
+        return dict(alignment_tolerance_pct=self.red_tolerances_pct.copy(), raw_limit_pct=self.raw_limit_pct)
 
     def run_settings(self, single):
         def axis(widgets, name):
@@ -857,6 +1106,7 @@ class WaveformWindow(W.QMainWindow):
             return scan_axis(*(widget.value() for widget in widgets), name)
 
         return SimulationSettings(axis(self.frequencies, "重频"), axis(self.widths, "脉宽"),
+                                  red_windows=self.red_windows.copy(),
                                   **self.evaluation_thresholds())
 
     def open_waveform(self):
@@ -870,7 +1120,8 @@ class WaveformWindow(W.QMainWindow):
         self.waveform_directory = str(source.parent)
         if self.scope_thread is not None and self.scope_thread.live:
             self.disconnect_scope()
-        self.start_evaluation(FileEvaluationSettings(source, self.evaluation_thresholds()))
+        self.start_evaluation(FileEvaluationSettings(source, self.evaluation_thresholds(),
+                                                     red_windows=self.red_windows.copy()))
 
     def single_evaluation(self):
         if self.scope_frozen:
@@ -897,7 +1148,8 @@ class WaveformWindow(W.QMainWindow):
         if self.worker is not None or frame is None or scope is None or scope.cancelled.is_set():
             return
         self.scope_frozen = True
-        self.start_evaluation(ScopeEvaluationSettings(frame, self.evaluation_thresholds()))
+        self.start_evaluation(ScopeEvaluationSettings(frame, self.evaluation_thresholds(),
+                                                      red_windows=self.red_windows.copy()))
 
     def start_run(self, *, single):
         if self.worker is not None or not self.simulation_toggle.isChecked():
@@ -937,9 +1189,7 @@ class WaveformWindow(W.QMainWindow):
                 self.append_log("开始模拟评价，共 1 个工况。", level="system")
             else:
                 self.append_log(f"开始模拟扫描，共 {settings.count} 个工况。", level="system")
-        thresholds = settings.thresholds
-        self.alignment_limit.setText(f"允许 ±{thresholds['alignment_tolerance_pct']:g}%")
-        self.raw_threshold.setText(f"要求 <{thresholds['raw_limit_pct']:g}%")
+        self.raw_threshold.setText(f"<{settings.thresholds['raw_limit_pct']:g}%")
         worker = EvaluationThread(settings, self)
         self.worker = worker
         worker.measurement_ready.connect(self.show_measurement)
@@ -1021,6 +1271,17 @@ class WaveformWindow(W.QMainWindow):
         self.verdict.setProperty("state", state)
         self.verdict.style().unpolish(self.verdict)
         self.verdict.style().polish(self.verdict)
+
+    def show_axis_readouts(self, shape=None):
+        for axis, (score_label, limit_label) in self.axis_readouts.items():
+            score = shape["axis_scores_pct"][axis] if shape is not None else None
+            limit = shape["regions"][axis]["reference_band_pct"][1] if shape is not None else None
+            exceeds_limit = score is not None and score > limit + ALIGNMENT_TOLERANCE_EPS
+            score_label.setText("—" if score is None else f"{score:.2f}%")
+            score_label.setProperty("state", "fail" if exceeds_limit else "")
+            score_label.style().unpolish(score_label)
+            score_label.style().polish(score_label)
+            limit_label.setText("—" if limit is None else f"±{limit:g}%")
 
     def show_axis_advice(self, shape=None):
         candidate = shape.get("candidate") if shape else None
@@ -1121,12 +1382,14 @@ class WaveformWindow(W.QMainWindow):
             self.plot.removeItem(item)
         self.scope_evaluation_items.clear()
         self.scope_preview_range = None
+        self.evaluated_pulse = None
         self.progress.setValue(0)
         self.set_verdict("待采集")
+        self.show_axis_readouts()
         self.show_axis_advice()
-        for value in (self.alignment_value, self.raw_value):
+        for value in (self.raw_value, self.raw_threshold):
             value.setText("—")
-        for value in (self.alignment_limit, self.raw_threshold, self.pulse_caption, self.reason):
+        for value in (self.pulse_caption, self.reason):
             value.clear()
 
     def show_measurement(self, measurement):
@@ -1155,10 +1418,11 @@ class WaveformWindow(W.QMainWindow):
             self.condition.setText(point)
             self.progress_label.setText(f"模拟 {measurement.index} / {settings.count} 个工况")
         self.set_verdict(verdict, state)
-        self.alignment_value.setText(aligned_value)
+        self.show_axis_readouts(shape)
         self.raw_value.setText(raw_value)
         self.show_axis_advice(shape)
         pulse = measurement.pulse
+        self.evaluated_pulse = pulse
         pulse_count = f"{len(flatness['pulses'])} 个完整脉冲"
         self.pulse_caption.setText(f"{pulse_count} · 图示第 {pulse['number']} 个")
         self.reason.setText("保持期不平度超限。" if shape["status"] == "flat" and not report["passed"]

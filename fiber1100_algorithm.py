@@ -312,26 +312,26 @@ def evaluate_record(record, *, window=None, confirmed_phase=None, point=None, pa
 
 
 def evaluate_shape_record(record, *, window=None, confirmed_phase=None,
-                          alignment_tolerance_pct=None, raw_limit_pct=15.):
+                          alignment_tolerance_pct=None, raw_limit_pct=15., red_windows=None):
     """Evaluate one capture from its samples, optionally on the session's locked window."""
     from waveform_core.shape_feedback import assess_shape
 
     if not np.isfinite(raw_limit_pct) or raw_limit_pct <= 0:
         raise ValueError('不平度上限须为大于 0 的有限百分比')
-    if alignment_tolerance_pct is None and window is not None and 'alignment_windows' in window:
+    locked_alignment = window is not None and 'alignment_windows' in window
+    if alignment_tolerance_pct is None and (red_windows is not None or locked_alignment):
         alignment_tolerance_pct = DEFAULT_ALIGNMENT_TOLERANCE_PCT
     aligned_mode = alignment_tolerance_pct is not None
-    if aligned_mode:
-        if not np.isfinite(alignment_tolerance_pct) or alignment_tolerance_pct < 0:
-            raise ValueError('红蓝允许偏差须为非负的有限百分比')
 
     if window is not None and confirmed_phase is not None:
         raise ValueError('锁定的比较窗和新框选的相位只能使用一项')
+    if window is not None and red_windows is not None:
+        raise ValueError('红区端点已按起始波形锁定，请开始新一轮再调整')
     if window is None:
         window = window_from_reference(record, confirmed_phase, use_saved_context=False)
         if aligned_mode:
-            window = adjust_reference_window(record, window, confirmed_phase=confirmed_phase)
-    elif aligned_mode and 'alignment_windows' not in window:
+            window = adjust_reference_window(record, window, confirmed_phase=confirmed_phase, red_windows=red_windows)
+    elif aligned_mode and not locked_alignment:
         raise ValueError('请从起始波形建立含红蓝四区的参考窗')
     phase = validate_phase_window(window['phase'])
     if not window.get('sensitivity_windows') or not np.array_equal(phase, window['sensitivity_windows'][0]):
@@ -340,7 +340,7 @@ def evaluate_shape_record(record, *, window=None, confirmed_phase=None,
                   timing_check=assert_frequency_consistent(record, window.get('reference_operating_point')))
     if aligned_mode:
         report['shape'] = assess_alignment(record, report, tolerance_pct=alignment_tolerance_pct)
-        report['thresholds'] = dict(alignment_tolerance_pct=float(alignment_tolerance_pct),
+        report['thresholds'] = dict(alignment_tolerance_pct=report['shape']['tolerance_pct'],
                                     raw_limit_pct=float(raw_limit_pct))
         report['passed'] = report['shape']['status'] == 'flat' and report['flatness']['raw_passed']
     else:
@@ -351,7 +351,7 @@ def evaluate_shape_record(record, *, window=None, confirmed_phase=None,
 def evaluate_waveform(time_s, voltage_v, **options):
     """Numerical entry for one record. Arrays use seconds and volts."""
     record = prepare_timed_waveform(time_s, voltage_v, point=options.get('point'))
-    shape_options = {'window', 'confirmed_phase', 'alignment_tolerance_pct', 'raw_limit_pct'}
+    shape_options = {'window', 'confirmed_phase', 'alignment_tolerance_pct', 'raw_limit_pct', 'red_windows'}
     if not (options.keys() - shape_options):
         return evaluate_shape_record(record, **options)
     return evaluate_record(record, **options)
@@ -359,7 +359,7 @@ def evaluate_waveform(time_s, voltage_v, **options):
 
 def run_leveling(capture, apply_step, *, initial_y, bounds, confirmed_phase=None,
                  max_trials=12, max_repeats=2, cancelled=None,
-                 alignment_tolerance_pct=None, raw_limit_pct=15.):
+                 alignment_tolerance_pct=None, raw_limit_pct=15., red_windows=None):
     """Drive the same feedback loop through acquisition and board callbacks.
 
     capture() saves fresh data to a CSV/NPZ and returns its path. apply_step()
@@ -379,7 +379,8 @@ def run_leveling(capture, apply_step, *, initial_y, bounds, confirmed_phase=None
         if cancelled is not None and cancelled():
             return dict(session.snapshot(), status="stopped", message="在初始采集前停止。")
         record = prepare_timed_file(capture())
-        report = evaluate_shape_record(record, confirmed_phase=confirmed_phase, **criteria)
+        report = evaluate_shape_record(record, confirmed_phase=confirmed_phase, red_windows=red_windows, **criteria)
+        criteria = report.get("thresholds", criteria)
         state = session.start(record, report)
         while state["next_action"] is not None:
             phase = "等待下一步"

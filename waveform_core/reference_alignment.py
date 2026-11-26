@@ -6,6 +6,7 @@ shoulder. All intervals are locked together when a leveling session starts.
 """
 
 import itertools
+from collections.abc import Mapping
 
 import numpy as np
 from scipy.signal import savgol_filter
@@ -49,10 +50,19 @@ def _ramp_end(pulse):
     return None
 
 
-def _clip_regions(phase):
+def _clip_regions(phase, red_windows):
     left, right = phase
+    windows = OBSERVATION_WINDOWS.copy()
+    if red_windows is not None:
+        if not isinstance(red_windows, Mapping) or red_windows.keys() - AXIS_LABELS.keys():
+            raise ValueError("红区端点须按 y0、y1、y2 设置。")
+        for axis, interval in red_windows.items():
+            try:
+                windows[axis] = validate_phase_window(interval)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(f"{axis} 红区须满足 0 ≤ 左端点 < 右端点 ≤ 1。") from error
     regions = {}
-    for name, (lo, hi) in OBSERVATION_WINDOWS.items():
+    for name, (lo, hi) in windows.items():
         if name == "y0":
             # The annotated left shoulder can precede the hold start.
             regions[name] = (lo, hi)
@@ -62,7 +72,7 @@ def _clip_regions(phase):
     return regions
 
 
-def adjust_reference_window(record, window, *, confirmed_phase=None):
+def adjust_reference_window(record, window, *, confirmed_phase=None, red_windows=None):
     """Apply the blue reference geometry to a window prepared by the evaluator."""
     automatic = window.get("automatic_phase")
     ramps = [_ramp_end(pulse) for pulse in record.pulses] if automatic is not None else []
@@ -78,7 +88,7 @@ def adjust_reference_window(record, window, *, confirmed_phase=None):
     confirmed = confirmed_phase is not None or window.get("confirmed", False)
     manual_phase = window["phase"] if confirmed_phase is None else confirmed_phase
     phase = validate_phase_window(manual_phase if confirmed else automatic)
-    regions = _clip_regions(phase)
+    regions = _clip_regions(phase, red_windows)
     bands = window.get("sensitivity_phase_bands")
     scenarios = [phase]
     sensitivity_available = bool(window.get("sensitivity_available") and bands is not None)
@@ -122,11 +132,30 @@ def _level(pulse, interval):
     return float(np.median(values)-pulse["baseline_v"])
 
 
+def _tolerance_value(value):
+    message = "红蓝允许偏差须为有限的非负百分比。"
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(message) from error
+    if not np.isfinite(value) or value < 0:
+        raise ValueError(message)
+    return value
+
+
+def validate_alignment_tolerance(tolerance_pct):
+    if not isinstance(tolerance_pct, Mapping):
+        return _tolerance_value(tolerance_pct)
+    if tolerance_pct.keys() - AXIS_LABELS.keys():
+        raise ValueError("红蓝允许偏差须按 y0、y1、y2 设置。")
+    return {axis: _tolerance_value(tolerance_pct.get(axis, DEFAULT_ALIGNMENT_TOLERANCE_PCT))
+            for axis in AXIS_LABELS}
+
+
 def assess_alignment(record, report, *, tolerance_pct=DEFAULT_ALIGNMENT_TOLERANCE_PCT):
     """Measure every complete pulse against its own locked blue reference."""
-    tolerance_pct = float(tolerance_pct)
-    if not np.isfinite(tolerance_pct) or tolerance_pct < 0:
-        raise ValueError("红蓝允许偏差须为有限的非负百分比。")
+    tolerance_pct = validate_alignment_tolerance(tolerance_pct)
+    limits = tolerance_pct if isinstance(tolerance_pct, dict) else dict.fromkeys(AXIS_LABELS, tolerance_pct)
 
     window, flatness = report["window"], report["flatness"]
     rows = flatness["pulses"]
@@ -134,7 +163,7 @@ def assess_alignment(record, report, *, tolerance_pct=DEFAULT_ALIGNMENT_TOLERANC
         raise ValueError("保持期评价与完整脉冲数量不一致。")
     windows = window["alignment_windows"]
     pulse_regions, profiles, failed, missing = {}, [], [], []
-    references, scores = [], []
+    references = []
     for row, pulse in zip(rows, record.pulses, strict=True):
         number = row["number"]
         if number != pulse["number"]:
@@ -150,23 +179,23 @@ def assess_alignment(record, report, *, tolerance_pct=DEFAULT_ALIGNMENT_TOLERANC
             height = _level(pulse, windows[axis])
             error = 100.*(height-reference)/reference if height is not None and reference is not None else None
             areas[axis] = dict(level_v=height, error_pct=error)
-        errors = [area["error_pct"] for area in areas.values()]
-        if all(error is not None for error in errors):
-            score = max(abs(error) for error in errors)
-            scores.append(score)
-            if score > tolerance_pct + ALIGNMENT_TOLERANCE_EPS:
-                failed.append(number)
-        else:
+        if any(area["error_pct"] is None for area in areas.values()):
             missing.append(number)
+        elif any(abs(area["error_pct"]) > limits[axis] + ALIGNMENT_TOLERANCE_EPS
+                 for axis, area in areas.items()):
+            failed.append(number)
         pulse_regions[number] = dict(reference_level_v=reference, areas=areas)
 
-    requested_limits = [-tolerance_pct, tolerance_pct]
-    voting_limits = [-tolerance_pct-ALIGNMENT_TOLERANCE_EPS, tolerance_pct+ALIGNMENT_TOLERANCE_EPS]
-    regions = {}
+    regions, axis_scores = {}, {}
     for axis, label in AXIS_LABELS.items():
         errors = [pulse["areas"][axis]["error_pct"] for pulse in pulse_regions.values()]
+        axis_scores[axis] = None if None in errors else max(abs(error) for error in errors)
+        requested = limits[axis]
+        voting = requested + ALIGNMENT_TOLERANCE_EPS
+        requested_limits = [-requested, requested]
+        voting_limits = [-voting, voting]
         result = _region_assessment(label, windows[axis], voting_limits, errors)
-        result["reference_band_pct"] = requested_limits.copy()
+        result["reference_band_pct"] = requested_limits
         if result["direction"] == "hold":
             result["reason"] = "该区域在红蓝允许偏差内。"
         regions[axis] = result
@@ -179,7 +208,8 @@ def assess_alignment(record, report, *, tolerance_pct=DEFAULT_ALIGNMENT_TOLERANC
     damaged = coverage == "early_loss_while_peers_hold" or any(row["geometry_recovered"] for row in rows)
     ramp_supported = window.get("alignment_ramp_supported", True)
     result = dict(status="uncertain", reason="", candidate=None, regions=regions,
-                  directions=directions, score_pct=max(scores) if not missing else None,
+                  directions=directions, score_pct=max(axis_scores.values()) if not missing else None,
+                  axis_scores_pct=axis_scores,
                   tolerance_pct=tolerance_pct, pulse_regions=pulse_regions,
                   reference_level_v=float(np.median(reference_values)) if reference_values else None,
                   raw_passed=bool(flatness["raw_passed"]), shape_failed_pulses=failed,

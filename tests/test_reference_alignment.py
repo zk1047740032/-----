@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from fiber1100_algorithm import evaluate_shape_record
+from fiber1100_algorithm import evaluate_shape_record, evaluate_waveform
 from waveform_core.leveling import LevelingSession
 from waveform_core.timing_pulses import prepare_timed_waveform
 
@@ -14,6 +14,37 @@ def capture(seed, dip=0., *, width=150):
 
 
 class ReferenceAlignmentTests(unittest.TestCase):
+    def test_custom_endpoints_and_independent_axis_tolerances(self):
+        time_s, voltage_v = samples(1, -.12, period=4000)
+        windows = {"y0": (.045, .11), "y1": (.14, .23), "y2": (.39, .54)}
+        limits = {"y0": 2., "y1": 3., "y2": 5.}
+        report = evaluate_waveform(time_s, voltage_v, red_windows=windows, confirmed_phase=(.16, .755),
+                                   alignment_tolerance_pct=limits, raw_limit_pct=20.)
+        self.assertEqual(report["window"]["alignment_windows"],
+                         windows | {"y1": (.16, .23), "reference": (.635, .755)})
+        self.assertEqual(report["shape"]["candidate"], {"axis": "y2", "step": 10})
+        self.assertFalse(report["passed"])
+
+        record = prepare_timed_waveform(time_s, voltage_v)
+        session = LevelingSession()
+        session.start(record, report)
+        with self.assertRaisesRegex(ValueError, "锁定"):
+            evaluate_shape_record(record, window=session.window, red_windows={"y2": (.4, .54)})
+        updated = evaluate_shape_record(record, window=session.window, raw_limit_pct=20.,
+                                        alignment_tolerance_pct=limits | {"y2": 15.})
+        self.assertTrue(updated["passed"])
+        self.assertEqual(updated["shape"]["pulse_regions"], report["shape"]["pulse_regions"])
+        self.assertEqual(updated["shape"]["regions"]["y0"]["reference_band_pct"], [-2., 2.])
+        self.assertEqual(updated["shape"]["regions"]["y2"]["reference_band_pct"], [-15., 15.])
+        self.assertEqual(session.reassess(record, updated)["status"], "flat")
+
+    def test_invalid_red_endpoints_and_tolerance_are_rejected(self):
+        record = capture(1)
+        with self.assertRaisesRegex(ValueError, "y1 红区"):
+            evaluate_shape_record(record, red_windows={"y1": (.25, .15)})
+        with self.assertRaisesRegex(ValueError, "允许偏差"):
+            evaluate_shape_record(record, alignment_tolerance_pct={"y1": float("nan")})
+
     def test_y0_stays_on_the_left_shoulder_when_hold_start_moves(self):
         record = capture(1, -.12)
         initial = evaluate_shape_record(record, alignment_tolerance_pct=7.)

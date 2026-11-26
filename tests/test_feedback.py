@@ -193,6 +193,29 @@ class WaveformFeedbackTests(unittest.TestCase):
                                   ("capture", 10), ("y2", 10), ("capture", 20)])
         self.assertEqual(state["best"]["parameters"], [100, 100, 120])
 
+    def test_automatic_runner_keeps_custom_red_windows_on_fresh_capture(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = []
+            for index, dip in enumerate((-.12, -.04)):
+                time, voltage = samples(index, dip)
+                path = Path(folder) / f"{index}.npz"
+                np.savez(path, time_s=time, voltage_v=voltage)
+                paths.append(path)
+            captures = iter(paths)
+            commands = []
+
+            def apply_step(axis, delta):
+                commands.append((axis, delta))
+                return True
+
+            state = run_leveling(lambda: next(captures), apply_step, initial_y=[100]*3, bounds=[(0, 200)]*3,
+                                 red_windows={"y2": (.39, .54)}, alignment_tolerance_pct={"y2": 5.},
+                                 raw_limit_pct=20.)
+        self.assertEqual(commands, [("y2", 10)])
+        self.assertEqual(state["status"], "flat", state["message"])
+        self.assertEqual(state["window"]["alignment_windows"]["y2"], (.39, .54))
+        self.assertEqual(state["best"]["parameters"], [100, 100, 110])
+
     def test_failed_command_is_never_repeated_and_bounds_are_not_clipped(self):
         with tempfile.TemporaryDirectory() as folder:
             time, voltage = samples(0, -.22)

@@ -63,7 +63,8 @@ def measurement(record, report, shape):
                 raw_bounds=flat["raw_window_band"], thresholds=thresholds, passed=report.get("passed"),
                 geometry_valid=geometry_valid,
                 rms_pct=rms, worst_rms_pct=float(flat["rms_max_pct"]),
-                shape_score_pct=score, shape_status=shape["status"], scans=scans,
+                shape_score_pct=score, axis_scores_pct=shape.get("axis_scores_pct"),
+                shape_status=shape["status"], scans=scans,
                 interval_ns=interval, width_ns=width, width_mad_ns=float(np.median(np.abs(widths-width))),
                 timing=deepcopy(report.get("timing_check", {})),
                 errors_pct={axis: shape.get("regions", {}).get(axis, {}).get("error_pct") for axis in AXES},
@@ -159,8 +160,14 @@ class LevelingSession:
                                    lower_bound_exact=bounds.get("lower_bound_exact", False),
                                    limit_pct=limit)["status"]
         score = obs["shape_score_pct"]
-        aligned = (obs["geometry_valid"] and score is not None
-                   and score <= self.thresholds["alignment_tolerance_pct"] + ALIGNMENT_TOLERANCE_EPS)
+        aligned = False
+        if obs["geometry_valid"] and score is not None:
+            tolerance = self.thresholds["alignment_tolerance_pct"]
+            if isinstance(tolerance, dict):
+                aligned = all(obs["axis_scores_pct"][axis] <= limit + ALIGNMENT_TOLERANCE_EPS
+                              for axis, limit in tolerance.items())
+            else:
+                aligned = score <= tolerance + ALIGNMENT_TOLERANCE_EPS
         return raw_passed, status, aligned
 
     def _update_best(self):
