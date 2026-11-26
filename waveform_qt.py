@@ -10,7 +10,8 @@ from threading import Event
 
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QRectF, QStandardPaths, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QIntValidator, QPainter, QPen, QTextCharFormat, QTextCursor
+from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QIcon, QIntValidator, QPainter, QPen,
+                          QTextCharFormat, QTextCursor)
 from PySide6 import QtWidgets as W
 from serial.tools.list_ports import comports
 
@@ -100,14 +101,25 @@ def card():
 
 
 class ScopeTimeAxis(pg.AxisItem):
+    division_ns = None
+
+    def set_scope_division(self, division_ns):
+        self.division_ns = division_ns
+        self.picture = None
+        self.update()
+
     def tickSpacing(self, minVal, maxVal, size):
-        levels = super().tickSpacing(minVal, maxVal, size)
-        if len(levels) != 1:
-            return levels
-        spacing, offset = levels[0]
-        # When zoomed far out, skip divisions while keeping the scope grid aligned.
-        step = max(1, ceil((maxVal - minVal) / (100 * spacing)))
-        return [(spacing * step, offset)]
+        spacing = self.division_ns
+        span = maxVal - minVal
+        if spacing is None or span < 2 * spacing:
+            return super().tickSpacing(minVal, maxVal, size)
+        metrics = QFontMetricsF(self.style["tickFont"] or W.QApplication.font())
+        labels = self.tickStrings([minVal, maxVal], 1, spacing)
+        label_width = max(metrics.horizontalAdvance(value) for value in labels)
+        # Skip full divisions as needed to leave room for the time labels.
+        label_spacing = span * (label_width + 10) / max(1, size)
+        step = max(1, ceil(label_spacing / spacing))
+        return [(spacing * step, 0)]
 
 
 class SimulationSwitch(W.QAbstractButton):
@@ -429,6 +441,7 @@ class WaveformWindow(W.QMainWindow):
         self.plot = pg.PlotWidget(background="#ffffff", axisItems={"bottom": self.time_axis})
         self.plot.setMinimumSize(0, 140)
         self.plot.setLabel("left", "电压", units="V", color="#6b7280")
+        self.plot.getViewBox().sigRangeChangedManually.connect(self.pause_scope_follow)
         self.plot.showGrid(x=True, y=True, alpha=0.22)
         self.plot.hideButtons()
         for axis in ("bottom", "left"):
@@ -617,18 +630,21 @@ class WaveformWindow(W.QMainWindow):
             self.plot.setLabel("bottom", "相对触发时刻", units="ns", color="#6b7280")
             self.scope_curve = self.plot.plot(pen=pg.mkPen("#2563eb", width=2), clipToView=True,
                                               autoDownsample=True, downsampleMethod="peak")
-            self.plot.enableAutoRange()
+            self.plot.getViewBox().setAutoVisible(y=True)
+            self.plot.enableAutoRange(y=True)
             self.zoom_button.setEnabled(True)
         scale_s = frame.horizontal_scale_s
         if scale_s is not None and (first_frame or scale_s != self.displayed_frame.horizontal_scale_s):
-            self.time_axis.setTickSpacing(levels=[(scale_s * 1e9, 0)])
-            self.window_legend.setText(f"水平标度  {pg.siFormat(scale_s, suffix='s', precision=6)}/格")
+            self.time_axis.set_scope_division(scale_s * 1e9)
+            self.window_legend.setText(f"示波器水平标度  {pg.siFormat(scale_s, suffix='s', precision=6)}/格")
+        if self.scope_follow_pulse and (first_frame or frame.pulse_view_ns != self.displayed_frame.pulse_view_ns):
+            self.set_scope_view(frame)
         self.scope_curve.setData(frame.time_s * 1e9, frame.voltage_v)
         self.displayed_frame = frame
         received = frame.received_at.strftime("%H:%M:%S.%f")[:-3]
         self.condition.setText(f"{SCOPE_CHANNEL} · {received}")
+        self.progress_label.setText("实时显示" if frame.pulse_view_ns else "未识别到完整脉冲")
         if first_frame:
-            self.progress_label.setText("实时显示")
             self.set_verdict("待评价")
             self.update_controls()
 
@@ -962,17 +978,34 @@ class WaveformWindow(W.QMainWindow):
             value.style().unpolish(value)
             value.style().polish(value)
 
+    def pause_scope_follow(self, axes):
+        if self.scope_curve is not None and axes[0]:
+            self.scope_follow_pulse = False
+
+    def set_scope_view(self, frame):
+        if frame.pulse_view_ns is None:
+            self.plot.enableAutoRange(x=True)
+        else:
+            self.plot.setXRange(*frame.pulse_view_ns, padding=0)
+
     def reset_zoom(self):
+        if self.displayed_frame is not None:
+            self.scope_follow_pulse = True
+            self.plot.enableAutoRange(y=True)
+            self.set_scope_view(self.displayed_frame)
+            return
         self.plot.enableAutoRange()
         self.plot.autoRange()
 
     def clear_measurement(self):
         self.plot.clear()
-        self.time_axis.setTickSpacing()
+        self.time_axis.set_scope_division(None)
         self.plot.setLabel("bottom", "相对上升 50% 交点", units="ns", color="#6b7280")
+        self.plot.getViewBox().setAutoVisible(y=False)
         self.plot.setRange(xRange=(0, 100), yRange=(0, 1), padding=0)
         self.scope_curve = None
         self.displayed_frame = None
+        self.scope_follow_pulse = True
         self.window_legend.setText("保持期 · 红区 y0–y2 · 蓝区参考")
         self.zoom_button.setEnabled(False)
         self.condition.clear()

@@ -37,10 +37,33 @@ class ScopeCaptureTests(unittest.TestCase):
         self.assertEqual((first.horizontal_scale_s, second.horizontal_scale_s), (40e-9, 80e-9))
         np.testing.assert_array_equal(first.time_s, second.time_s)
         self.assertEqual(second.sample_interval_s, 2e-9)
+        self.assertIsNone(first.pulse_view_ns)
         with self.assertRaisesRegex(ValueError, "水平标度无效"):
             scope.read_frame()
         commands = [call.args[0] for call in socket.sendall.call_args_list]
         self.assertEqual(commands.count(b"HORIZONTAL:SCALE?\n"), 3)
+
+    def test_long_record_keeps_all_samples_and_focuses_the_pulse_nearest_the_trigger(self):
+        points = 90_001
+        time_ns = -36_000 + np.arange(points) * 0.8
+        preamble = (PREAMBLE.replace(b"NR_PT 20", f"NR_PT {points}".encode())
+                    .replace(b"XINCR 2E-9", b"XINCR 8E-10").replace(b"XZERO -8E-9", b"XZERO -36E-6"))
+        for width_ns, scale_ns, view_ns in ((150, 40, 400), (800, 40, 1120), (150, 5000, 600)):
+            with self.subTest(width_ns=width_ns, scale_ns=scale_ns):
+                high = (time_ns - 20) % 20_000 < width_ns
+                payload = np.where(high, 200, 0).astype(">i2").tobytes()
+                capture = (f"{points}\n".encode() + preamble + f"#6{len(payload)}".encode()
+                           + payload + f"\n{scale_ns}e-9\n".encode())
+                frame = ScopeConnection(Mock(), BytesIO(capture)).read_frame()
+
+                self.assertEqual(frame.time_s.size, points)
+                np.testing.assert_allclose(frame.time_s * 1e9, time_ns, atol=1e-8)
+                lo, hi = frame.pulse_view_ns
+                self.assertLess(lo, 20)
+                self.assertGreater(hi, 20 + width_ns)
+                self.assertGreater(lo, -20_000 + 20 + width_ns)
+                self.assertLess(hi, 20_000 + 20)
+                self.assertAlmostEqual(hi - lo, view_ns, delta=2)
 
     def test_incomplete_or_unsupported_frame_is_rejected(self):
         payload = bytes(40)

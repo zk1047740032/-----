@@ -6,6 +6,8 @@ from math import isfinite
 
 import numpy as np
 
+from waveform_core.pulse_metrics import locate_pulses
+
 
 SCOPE_PORT = 4000
 SCOPE_CHANNEL = "CH2"
@@ -22,6 +24,34 @@ class ScopeFrame:
     sample_interval_s: float
     received_at: datetime
     horizontal_scale_s: float | None = None
+    pulse_view_ns: tuple[float, float] | None = None
+
+
+def _single_pulse_view_ns(frame, scale_s):
+    t = frame.time_s
+    pulses, _ = locate_pulses(t, frame.voltage_v, frame.sample_interval_s)
+    if not pulses:
+        return None
+
+    def distance_to_trigger(index):
+        start, stop = pulses[index]
+        return max(t[start], -t[stop], 0)
+
+    index = min(range(len(pulses)), key=distance_to_trigger)
+    start, stop = pulses[index]
+    rise, fall = t[start], t[stop]
+    width = fall - rise
+    # Use ten scope divisions if they give a view that includes the whole pulse
+    # and its baseline without making the pulse too small to inspect.
+    span = min(4 * width, max(1.4 * width, 10 * scale_s))
+    left, right = t[0], t[-1]
+    if index > 0:
+        left = (t[pulses[index - 1][1]] + rise) / 2
+    if index + 1 < len(pulses):
+        right = (fall + t[pulses[index + 1][0]]) / 2
+    span = min(span, right - left)
+    lo = max(left, min((rise + fall - span) / 2, right - span))
+    return float(lo * 1e9), float((lo + span) * 1e9)
 
 
 def read_waveform(stream):
@@ -144,6 +174,7 @@ class ScopeConnection:
                     raise ValueError("示波器返回的水平标度无效。") from error
                 if scale_s <= 0 or not isfinite(scale_s):
                     raise ValueError("示波器返回的水平标度无效。")
-                return replace(frame, horizontal_scale_s=scale_s)
+                return replace(frame, horizontal_scale_s=scale_s,
+                               pulse_view_ns=_single_pulse_view_ns(frame, scale_s))
             self.stop_point = None
         raise ValueError("传回的波形点数与当前记录长度不一致，请重新连接示波器。")
