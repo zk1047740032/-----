@@ -6,10 +6,11 @@ from math import ceil
 from pathlib import Path
 import socket
 import sys
-from threading import Event
+from threading import Event, Lock
+from time import monotonic
 
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QRectF, QStandardPaths, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QRectF, QStandardPaths, QThread, Qt, Signal
 from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QIcon, QIntValidator, QPainter, QPen,
                           QTextCharFormat, QTextCursor)
 from PySide6 import QtWidgets as W
@@ -175,6 +176,8 @@ class EvaluationThread(QThread):
 
 class ScopeThread(QThread):
     identified = Signal(str)
+    frame_ready = Signal()
+    frame_period_s = 1 / 60
 
     def __init__(self, address, live, parent):
         super().__init__(parent)
@@ -183,7 +186,9 @@ class ScopeThread(QThread):
         self.cancelled = Event()
         self.connection = None
         self.identity = ""
-        self.latest_frame = None
+        self._frame_lock = Lock()
+        self._latest_frame = None
+        self._frame_pending = False
         self.error = ""
 
     def run(self):
@@ -200,13 +205,27 @@ class ScopeThread(QThread):
                         return
                     scope.configure_waveform()
                     while not self.cancelled.is_set():
-                        self.latest_frame = scope.read_frame()
-                        self.cancelled.wait(0.25)
+                        started = monotonic()
+                        self._publish_frame(scope.read_frame())
+                        self.cancelled.wait(max(0., self.frame_period_s - (monotonic() - started)))
         except (OSError, ValueError) as error:
             if not self.cancelled.is_set():
                 self.error = str(error) or type(error).__name__
         finally:
             self.connection = None
+
+    def _publish_frame(self, frame):
+        with self._frame_lock:
+            self._latest_frame = frame
+            if self._frame_pending:
+                return
+            self._frame_pending = True
+        self.frame_ready.emit()
+
+    def take_latest_frame(self):
+        with self._frame_lock:
+            self._frame_pending = False
+            return self._latest_frame
 
     def stop(self):
         self.cancelled.set()
@@ -254,9 +273,11 @@ class WaveformWindow(W.QMainWindow):
         self.scope_thread = None
         self.board_thread = None
         self.board_connection = None
-        self.scope_refresh = QTimer(self, interval=100)
-        self.scope_refresh.timeout.connect(self.refresh_scope_frame)
         self.scope_frozen = False
+        self.scope_regions = []
+        self.displayed_frame = None
+        self.scope_curve = None
+        self.scope_rendered = (None, None)
         self.closing = False
         self.waveform_directory = ""
         self.setStyleSheet(STYLE)
@@ -441,7 +462,9 @@ class WaveformWindow(W.QMainWindow):
         self.plot = pg.PlotWidget(background="#ffffff", axisItems={"bottom": self.time_axis})
         self.plot.setMinimumSize(0, 140)
         self.plot.setLabel("left", "电压", units="V", color="#6b7280")
-        self.plot.getViewBox().sigRangeChangedManually.connect(self.pause_scope_follow)
+        view = self.plot.getViewBox()
+        view.sigRangeChangedManually.connect(self.pause_scope_follow)
+        view.sigXRangeChanged.connect(self.render_scope_curve)
         self.plot.showGrid(x=True, y=True, alpha=0.22)
         self.plot.hideButtons()
         for axis in ("bottom", "left"):
@@ -578,7 +601,7 @@ class WaveformWindow(W.QMainWindow):
             self.condition.setText(SCOPE_CHANNEL)
             self.condition.setToolTip(address)
             self.progress_label.setText("正在连接示波器…")
-            self.scope_refresh.start()
+            scope.frame_ready.connect(self.refresh_scope_frame, Qt.ConnectionType.QueuedConnection)
         self.append_log(f"正在连接示波器 {address}（TCP {SCOPE_PORT}）。", level="system")
         scope.identified.connect(self.show_scope_identity)
         scope.finished.connect(self.finish_scope_connection)
@@ -596,7 +619,6 @@ class WaveformWindow(W.QMainWindow):
     def disconnect_scope(self):
         scope = self.scope_thread
         scope.stop()
-        self.scope_refresh.stop()
         if scope.live:
             self.scope_frozen = False
             self.clear_measurement()
@@ -607,7 +629,6 @@ class WaveformWindow(W.QMainWindow):
     def finish_scope_connection(self):
         scope = self.scope_thread
         self.scope_thread = None
-        self.scope_refresh.stop()
         scope.deleteLater()
         if scope.error and not scope.cancelled.is_set():
             self.append_log(f"示波器 {scope.address} 连接或读取失败。{scope.error}", level="error")
@@ -622,7 +643,7 @@ class WaveformWindow(W.QMainWindow):
         scope = self.scope_thread
         if self.scope_frozen or scope is None or scope.cancelled.is_set():
             return
-        frame = scope.latest_frame
+        frame = scope.take_latest_frame()
         if frame is None or frame is self.displayed_frame:
             return
         first_frame = self.displayed_frame is None
@@ -637,10 +658,11 @@ class WaveformWindow(W.QMainWindow):
         if scale_s is not None and (first_frame or scale_s != self.displayed_frame.horizontal_scale_s):
             self.time_axis.set_scope_division(scale_s * 1e9)
             self.window_legend.setText(f"示波器水平标度  {pg.siFormat(scale_s, suffix='s', precision=6)}/格")
-        if self.scope_follow_pulse and (first_frame or frame.pulse_view_ns != self.displayed_frame.pulse_view_ns):
-            self.set_scope_view(frame)
-        self.scope_curve.setData(frame.time_s * 1e9, frame.voltage_v)
+        follow_pulse = self.scope_follow_pulse and (first_frame or frame.pulse_view_ns != self.displayed_frame.pulse_view_ns)
         self.displayed_frame = frame
+        if follow_pulse:
+            self.set_scope_view(frame)
+        self.render_scope_curve()
         received = frame.received_at.strftime("%H:%M:%S.%f")[:-3]
         self.condition.setText(f"{SCOPE_CHANNEL} · {received}")
         self.progress_label.setText("实时显示" if frame.pulse_view_ns else "未识别到完整脉冲")
@@ -988,31 +1010,59 @@ class WaveformWindow(W.QMainWindow):
         else:
             self.plot.setXRange(*frame.pulse_view_ns, padding=0)
 
+    def render_scope_curve(self):
+        frame = self.displayed_frame
+        if frame is None:
+            return
+        view = self.plot.getViewBox()
+        samples = slice(None)
+        if not view.autoRangeEnabled()[0]:
+            left, right = view.viewRange()[0]
+            first, stop = frame.time_s.searchsorted((left * 1e-9, right * 1e-9))
+            # Keep samples outside the viewport for the line and peak downsampling at its edges.
+            pad = max(1, ceil((stop - first) / max(1, view.width())))
+            samples = slice(max(0, first - pad), min(frame.time_s.size, stop + pad))
+
+        previous_frame, previous_samples = self.scope_rendered
+        if previous_frame is frame and previous_samples == samples:
+            return
+        if previous_frame is not None and previous_frame.time_s is frame.time_s and previous_samples == samples:
+            time_ns, _ = self.scope_curve.getOriginalDataset()
+        else:
+            time_ns = frame.time_s[samples] * 1e9
+        self.scope_rendered = (frame, samples)
+        self.scope_curve.setData(time_ns, frame.voltage_v[samples])
+
     def reset_zoom(self):
         if self.displayed_frame is not None:
             self.scope_follow_pulse = True
             self.plot.enableAutoRange(y=True)
             self.set_scope_view(self.displayed_frame)
+            self.render_scope_curve()
             return
         self.plot.enableAutoRange()
         self.plot.autoRange()
 
     def clear_measurement(self):
+        self.clear_evaluation()
+        self.scope_curve = None
+        self.displayed_frame = None
+        self.scope_rendered = (None, None)
         self.plot.clear()
         self.time_axis.set_scope_division(None)
         self.plot.setLabel("bottom", "相对上升 50% 交点", units="ns", color="#6b7280")
         self.plot.getViewBox().setAutoVisible(y=False)
         self.plot.setRange(xRange=(0, 100), yRange=(0, 1), padding=0)
-        self.scope_curve = None
-        self.displayed_frame = None
         self.scope_follow_pulse = True
         self.window_legend.setText("保持期 · 红区 y0–y2 · 蓝区参考")
         self.zoom_button.setEnabled(False)
         self.condition.clear()
         self.condition.setToolTip("")
-        self.clear_evaluation()
 
     def clear_evaluation(self):
+        for region in self.scope_regions:
+            self.plot.removeItem(region)
+        self.scope_regions.clear()
         self.progress.setValue(0)
         self.set_verdict("待采集")
         self.show_axis_advice()
@@ -1055,13 +1105,13 @@ class WaveformWindow(W.QMainWindow):
         self.pulse_caption.setText(pulse_count if scope_mode else f"{pulse_count} · 图示第 {pulse['number']} 个")
         self.reason.setText("保持期不平度超限。" if shape["status"] == "flat" and not report["passed"]
                             else shape["reason"])
-        if not scope_mode:
+        if scope_mode:
+            self.scope_regions = self.add_evaluation_regions(report["window"], measurement.scope_pulse_geometry)
+        else:
             self.draw_pulse(pulse, report["window"])
 
-    def draw_pulse(self, pulse, window):
-        self.plot.clear()
-        t, voltage, width = pulse["time_ns"], pulse["voltage_v"], pulse["width50_ns"]
-        visible = (t >= -0.18 * width) & (t <= 1.18 * width)
+    def add_evaluation_regions(self, window, pulse_geometry):
+        regions = []
         areas = [("hold", window["phase"]), *window["alignment_windows"].items()]
         for role, interval in areas:
             if interval is None:
@@ -1072,9 +1122,20 @@ class WaveformWindow(W.QMainWindow):
                 fill, edge = (106, 151, 237, 50), (106, 151, 237, 148)
             else:
                 fill, edge = (223, 118, 128, 50), (223, 118, 128, 148)
-            region = pg.LinearRegionItem([part * width for part in interval], movable=False,
-                                         brush=fill, pen=pg.mkPen(edge))
-            self.plot.addItem(region, ignoreBounds=True)
+            pen = pg.mkPen(edge)
+            for rise50_ns, width_ns in pulse_geometry:
+                region = pg.LinearRegionItem([rise50_ns + part * width_ns for part in interval],
+                                             movable=False, brush=fill, pen=pen)
+                region.setZValue(-1)
+                self.plot.addItem(region, ignoreBounds=True)
+                regions.append(region)
+        return regions
+
+    def draw_pulse(self, pulse, window):
+        self.plot.clear()
+        t, voltage, width = pulse["time_ns"], pulse["voltage_v"], pulse["width50_ns"]
+        visible = (t >= -0.18 * width) & (t <= 1.18 * width)
+        self.add_evaluation_regions(window, ((0., width),))
         self.plot.plot(t[visible], voltage[visible], pen=pg.mkPen("#2563eb", width=2),
                        autoDownsample=True, downsampleMethod="peak")
         self.zoom_button.setEnabled(True)
@@ -1087,7 +1148,6 @@ class WaveformWindow(W.QMainWindow):
             super().closeEvent(event)
             return
         self.closing = True
-        self.scope_refresh.stop()
         if self.scope_thread is not None:
             self.scope_thread.stop()
         self.stop_run()

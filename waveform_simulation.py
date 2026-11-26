@@ -90,6 +90,8 @@ class Measurement:
     report: dict
     pulse: dict
     source_file: Path | None = None
+    # (Rise 50% relative to trigger, half-height width) in ns for each scope pulse.
+    scope_pulse_geometry: tuple[tuple[float, float], ...] = ()
 
     @property
     def verdict(self):
@@ -193,8 +195,13 @@ def run_evaluation(settings: SimulationSettings | FileEvaluationSettings | Scope
                 return SimulationOutcome("stopped", evaluated)
             pulse = next(pulse for pulse in record.pulses
                          if pulse["number"] == report["shape"]["representative_pulse"])
+            scope_pulse_geometry = ()
+            if isinstance(settings, ScopeEvaluationSettings):
+                scope_pulse_geometry = tuple((p["timing_start_s"] * 1e9, p["width50_ns"])
+                                             for p in record.pulses)
             evaluated = index
-            on_measurement(Measurement(index, frequency, width, report, pulse, source_file))
+            on_measurement(Measurement(index, frequency, width, report, pulse, source_file,
+                                       scope_pulse_geometry=scope_pulse_geometry))
     except Exception as exc:
         return SimulationOutcome("failed", evaluated, str(exc) or type(exc).__name__, condition)
     return SimulationOutcome("completed", evaluated)

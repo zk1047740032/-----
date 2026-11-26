@@ -50,7 +50,7 @@ def prepare_comparison_waveform(time_s, voltage_v, *, sample_interval_s=None, pa
                      'amplitude_v': m['amplitude_v'], 'width50_ns': m['width50_ns'],
                      'rise10_ns': (m['rise10_s']-m['rise50_s'])*1e9,
                      'fall10_ns': (m['fall10_s']-m['rise50_s'])*1e9,
-                     'legacy99_phase': initial}
+                     'legacy99_phase': initial, 'timing_start_s': m['rise50_s']}
             pulse['auto_hold'] = suggest_hold_window(pulse)
             pulse['suggested_phase'] = pulse['auto_hold'].get('phase_window')
             pulses.append(pulse)

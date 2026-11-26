@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+from functools import lru_cache
 from math import isfinite
 
 import numpy as np
@@ -15,6 +16,7 @@ SCOPE_TIMEOUT_S = 3.0
 MAX_SCOPE_POINTS = 1_000_000
 MAX_TEXT_BYTES = 512
 MAX_PREAMBLE_BYTES = 4096
+FOCUS_SAMPLES_PER_SIDE = 16_384
 
 
 @dataclass(frozen=True)
@@ -27,9 +29,33 @@ class ScopeFrame:
     pulse_view_ns: tuple[float, float] | None = None
 
 
+@lru_cache(maxsize=2)
+def _sample_times(points, interval, origin):
+    time_s = np.arange(points, dtype=float)
+    time_s *= interval
+    time_s += origin
+    if not isfinite(time_s[-1]):
+        raise ValueError("WAVFRM? 的时间换算结果无效。")
+    time_s.flags.writeable = False
+    return time_s
+
+
 def _single_pulse_view_ns(frame, scale_s):
     t = frame.time_s
-    pulses, _ = locate_pulses(t, frame.voltage_v, frame.sample_interval_s)
+    if t.size > 4 * FOCUS_SAMPLES_PER_SIDE and t[0] <= 0 <= t[-1]:
+        trigger_index = int(t.searchsorted(0.))
+        start = max(0, trigger_index - FOCUS_SAMPLES_PER_SIDE)
+        stop = min(t.size, trigger_index + FOCUS_SAMPLES_PER_SIDE)
+        view = _pulse_view_ns(frame, scale_s, start, stop)
+        if view is not None:
+            return view
+    return _pulse_view_ns(frame, scale_s, 0, t.size)
+
+
+def _pulse_view_ns(frame, scale_s, first, stop):
+    t = frame.time_s[first:stop]
+    voltage = frame.voltage_v[first:stop]
+    pulses, diagnostics = locate_pulses(t, voltage, frame.sample_interval_s)
     if not pulses:
         return None
 
@@ -44,13 +70,20 @@ def _single_pulse_view_ns(frame, scale_s):
     # Use ten scope divisions if they give a view that includes the whole pulse
     # and its baseline without making the pulse too small to inspect.
     span = min(4 * width, max(1.4 * width, 10 * scale_s))
-    left, right = t[0], t[-1]
+    left, right = frame.time_s[0], frame.time_s[-1]
     if index > 0:
         left = (t[pulses[index - 1][1]] + rise) / 2
     if index + 1 < len(pulses):
         right = (fall + t[pulses[index + 1][0]]) / 2
     span = min(span, right - left)
     lo = max(left, min((rise + fall - span) / 2, right - span))
+    # A cropped edge may hide a partial pulse or a neighbor that limits the view.
+    threshold = diagnostics["baseline_v"] + .5 * diagnostics["bootstrap_amplitude_v"]
+    if first and (voltage[0] >= threshold or (index == 0 and lo < (t[0] + rise) / 2)):
+        return None
+    if stop < frame.time_s.size and (voltage[-1] >= threshold
+                                     or (index == len(pulses) - 1 and lo + span > (fall + t[-1]) / 2)):
+        return None
     return float(lo * 1e9), float((lo + span) * 1e9)
 
 
@@ -105,9 +138,13 @@ def read_waveform(stream):
     if terminator != b"\n":
         raise ValueError("WAVFRM? 二进制波形未完整接收。")
 
-    time_s = origin + np.arange(points, dtype=float) * interval
-    voltage_v = (np.frombuffer(payload, dtype=">i2").astype(float) - offset) * gain + zero
-    time_s.flags.writeable = False
+    time_s = _sample_times(points, interval, origin)
+    voltage_v = np.frombuffer(payload, dtype=">i2").astype(float)
+    voltage_v -= offset
+    voltage_v *= gain
+    voltage_v += zero
+    if not np.isfinite(voltage_v).all():
+        raise ValueError("WAVFRM? 的电压换算结果无效。")
     voltage_v.flags.writeable = False
     return ScopeFrame(time_s, voltage_v, interval, datetime.now().astimezone())
 
