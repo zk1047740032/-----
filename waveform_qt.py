@@ -31,6 +31,10 @@ from waveform_simulation import (
 )
 
 
+PULSE_TIME_LABEL = "相对上升 50% 交点"
+PULSE_LEGEND = "保持期 · 红区 y0–y2 · 蓝区参考"
+
+
 STYLE = """
 QMainWindow { background: #f4f6f9; }
 QWidget { color: #2c3e50; font-size: 13px; }
@@ -296,7 +300,8 @@ class WaveformWindow(W.QMainWindow):
         self.board_thread = None
         self.board_connection = None
         self.scope_frozen = False
-        self.scope_regions = []
+        self.scope_evaluation_items = []
+        self.scope_preview_range = None
         self.displayed_frame = None
         self.scope_curve = None
         self.scope_rendered = (None, None)
@@ -498,7 +503,7 @@ class WaveformWindow(W.QMainWindow):
             item.enableAutoSIPrefix(False)
         frame.addWidget(self.plot, 1)
         legend_row = W.QHBoxLayout()
-        self.window_legend = label("保持期 · 红区 y0–y2 · 蓝区参考", "muted")
+        self.window_legend = label(PULSE_LEGEND, "muted")
         self.window_legend.setWordWrap(True)
         legend_row.addWidget(self.window_legend, 1)
         self.zoom_button = W.QPushButton("重置缩放")
@@ -672,8 +677,9 @@ class WaveformWindow(W.QMainWindow):
             return
         previous = self.displayed_frame
         first_frame = previous is None
-        if self.scope_curve is None:
+        if first_frame:
             self.plot.setLabel("bottom", "相对触发时刻", units="ns", color="#6b7280")
+        if self.scope_curve is None:
             self.scope_curve = self.plot.plot(pen=pg.mkPen("#2563eb", width=2), clipToView=True,
                                               autoDownsample=True, downsampleMethod="peak")
             self.zoom_button.setEnabled(True)
@@ -873,8 +879,13 @@ class WaveformWindow(W.QMainWindow):
                 self.clear_measurement()
                 self.progress_label.setText("请连接示波器")
             else:
-                self.clear_evaluation()
+                preview_range = self.scope_preview_range
                 self.displayed_frame = None
+                self.clear_evaluation()
+                if preview_range is not None:
+                    x_range, y_range = preview_range
+                    self.plot.setRange(xRange=x_range, yRange=y_range, padding=0)
+                    self.scope_curve.show()
                 self.refresh_scope_frame()
             self.update_controls()
             return
@@ -1033,7 +1044,7 @@ class WaveformWindow(W.QMainWindow):
             value.style().polish(value)
 
     def pause_scope_follow(self, axes):
-        if self.scope_curve is not None and axes[0]:
+        if self.scope_curve is not None and self.scope_preview_range is None and axes[0]:
             self.scope_follow_pulse = False
 
     def set_scope_view(self, frame):
@@ -1053,7 +1064,7 @@ class WaveformWindow(W.QMainWindow):
 
     def render_scope_curve(self):
         frame = self.displayed_frame
-        if frame is None:
+        if frame is None or self.scope_preview_range is not None:
             return
         view = self.plot.getViewBox()
         samples = slice(None)
@@ -1075,11 +1086,16 @@ class WaveformWindow(W.QMainWindow):
         self.scope_curve.setData(time_ns, frame.voltage_v[samples])
 
     def reset_zoom(self):
-        if self.displayed_frame is not None:
-            self.scope_follow_pulse = True
-            self.set_scope_voltage_view(self.displayed_frame)
-            self.set_scope_view(self.displayed_frame)
-            self.render_scope_curve()
+        frame = self.displayed_frame
+        if frame is not None:
+            self.set_scope_voltage_view(frame)
+            if self.scope_preview_range is not None:
+                x_range, _ = self.plot.getViewBox().childrenBounds()
+                self.plot.setXRange(*x_range)
+            else:
+                self.scope_follow_pulse = True
+                self.set_scope_view(frame)
+                self.render_scope_curve()
             return
         self.plot.enableAutoRange()
         self.plot.autoRange()
@@ -1092,18 +1108,19 @@ class WaveformWindow(W.QMainWindow):
         self.plot.clear()
         self.time_axis.set_scope_division(None)
         self.voltage_axis.set_scope_division(None)
-        self.plot.setLabel("bottom", "相对上升 50% 交点", units="ns", color="#6b7280")
+        self.plot.setLabel("bottom", PULSE_TIME_LABEL, units="ns", color="#6b7280")
         self.plot.setRange(xRange=(0, 100), yRange=(0, 1), padding=0)
         self.scope_follow_pulse = True
-        self.window_legend.setText("保持期 · 红区 y0–y2 · 蓝区参考")
+        self.window_legend.setText(PULSE_LEGEND)
         self.zoom_button.setEnabled(False)
         self.condition.clear()
         self.condition.setToolTip("")
 
     def clear_evaluation(self):
-        for region in self.scope_regions:
-            self.plot.removeItem(region)
-        self.scope_regions.clear()
+        for item in self.scope_evaluation_items:
+            self.plot.removeItem(item)
+        self.scope_evaluation_items.clear()
+        self.scope_preview_range = None
         self.progress.setValue(0)
         self.set_verdict("待采集")
         self.show_axis_advice()
@@ -1143,13 +1160,10 @@ class WaveformWindow(W.QMainWindow):
         self.show_axis_advice(shape)
         pulse = measurement.pulse
         pulse_count = f"{len(flatness['pulses'])} 个完整脉冲"
-        self.pulse_caption.setText(pulse_count if scope_mode else f"{pulse_count} · 图示第 {pulse['number']} 个")
+        self.pulse_caption.setText(f"{pulse_count} · 图示第 {pulse['number']} 个")
         self.reason.setText("保持期不平度超限。" if shape["status"] == "flat" and not report["passed"]
                             else shape["reason"])
-        if scope_mode:
-            self.scope_regions = self.add_evaluation_regions(report["window"], measurement.scope_pulse_geometry)
-        else:
-            self.draw_pulse(pulse, report["window"])
+        self.draw_pulse(pulse, report["window"], scope_mode=scope_mode)
 
     def add_evaluation_regions(self, window, pulse_geometry):
         regions = []
@@ -1172,13 +1186,26 @@ class WaveformWindow(W.QMainWindow):
                 regions.append(region)
         return regions
 
-    def draw_pulse(self, pulse, window):
-        self.plot.clear()
+    def draw_pulse(self, pulse, window, *, scope_mode=False):
+        if scope_mode:
+            self.scope_preview_range = self.plot.viewRange()
+            self.scope_curve.hide()
+            self.time_axis.set_scope_division(None)
+            self.plot.setLabel("bottom", PULSE_TIME_LABEL, units="ns", color="#6b7280")
+            scale_v = self.displayed_frame.vertical_scale_v
+            legend = PULSE_LEGEND
+            if scale_v is not None:
+                legend = f"{SCOPE_CHANNEL} 垂直 {pg.siFormat(scale_v, suffix='V', precision=6)}/格 · {legend}"
+            self.window_legend.setText(legend)
+        else:
+            self.plot.clear()
         t, voltage, width = pulse["time_ns"], pulse["voltage_v"], pulse["width50_ns"]
         visible = (t >= -0.18 * width) & (t <= 1.18 * width)
-        self.add_evaluation_regions(window, ((0., width),))
-        self.plot.plot(t[visible], voltage[visible], pen=pg.mkPen("#2563eb", width=2),
-                       autoDownsample=True, downsampleMethod="peak")
+        regions = self.add_evaluation_regions(window, ((0., width),))
+        curve = self.plot.plot(t[visible], voltage[visible], pen=pg.mkPen("#2563eb", width=2),
+                               autoDownsample=True, downsampleMethod="peak")
+        if scope_mode:
+            self.scope_evaluation_items = [curve, *regions]
         self.zoom_button.setEnabled(True)
         self.reset_zoom()
 
