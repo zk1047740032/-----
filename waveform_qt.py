@@ -123,6 +123,28 @@ class ScopeTimeAxis(pg.AxisItem):
         return [(spacing * step, 0)]
 
 
+class ScopeVoltageAxis(pg.AxisItem):
+    division_v = None
+    grid_origin_v = 0.
+
+    def set_scope_division(self, division_v, origin_v=0.):
+        self.division_v = division_v
+        self.grid_origin_v = origin_v
+        self.picture = None
+        self.update()
+
+    def tickSpacing(self, minVal, maxVal, size):
+        spacing = self.division_v
+        if spacing is not None and 2 * spacing <= maxVal - minVal <= 16 * spacing:
+            return [(spacing, self.grid_origin_v)]
+        return super().tickSpacing(minVal, maxVal, size)
+
+    def tickStrings(self, values, scale, spacing):
+        if self.division_v is None:
+            return super().tickStrings(values, scale, spacing)
+        return [f"{0. if abs(value) < spacing * 1e-9 else value * scale:.8g}" for value in values]
+
+
 class SimulationSwitch(W.QAbstractButton):
     def __init__(self):
         super().__init__()
@@ -459,7 +481,9 @@ class WaveformWindow(W.QMainWindow):
         frame = W.QVBoxLayout()
         frame.setSpacing(4)
         self.time_axis = ScopeTimeAxis("bottom")
-        self.plot = pg.PlotWidget(background="#ffffff", axisItems={"bottom": self.time_axis})
+        self.voltage_axis = ScopeVoltageAxis("left")
+        self.plot = pg.PlotWidget(background="#ffffff",
+                                  axisItems={"bottom": self.time_axis, "left": self.voltage_axis})
         self.plot.setMinimumSize(0, 140)
         self.plot.setLabel("left", "电压", units="V", color="#6b7280")
         view = self.plot.getViewBox()
@@ -646,20 +670,28 @@ class WaveformWindow(W.QMainWindow):
         frame = scope.take_latest_frame()
         if frame is None or frame is self.displayed_frame:
             return
-        first_frame = self.displayed_frame is None
+        previous = self.displayed_frame
+        first_frame = previous is None
         if self.scope_curve is None:
             self.plot.setLabel("bottom", "相对触发时刻", units="ns", color="#6b7280")
             self.scope_curve = self.plot.plot(pen=pg.mkPen("#2563eb", width=2), clipToView=True,
                                               autoDownsample=True, downsampleMethod="peak")
-            self.plot.getViewBox().setAutoVisible(y=True)
-            self.plot.enableAutoRange(y=True)
             self.zoom_button.setEnabled(True)
-        scale_s = frame.horizontal_scale_s
-        if scale_s is not None and (first_frame or scale_s != self.displayed_frame.horizontal_scale_s):
-            self.time_axis.set_scope_division(scale_s * 1e9)
-            self.window_legend.setText(f"示波器水平标度  {pg.siFormat(scale_s, suffix='s', precision=6)}/格")
-        follow_pulse = self.scope_follow_pulse and (first_frame or frame.pulse_view_ns != self.displayed_frame.pulse_view_ns)
+        scale_s, scale_v = frame.horizontal_scale_s, frame.vertical_scale_v
+        if first_frame or (scale_s, scale_v) != (previous.horizontal_scale_s, previous.vertical_scale_v):
+            scales = []
+            if scale_s is not None:
+                self.time_axis.set_scope_division(scale_s * 1e9)
+                scales.append(f"水平 {pg.siFormat(scale_s, suffix='s', precision=6)}/格")
+            if scale_v is not None:
+                scales.append(f"{SCOPE_CHANNEL} 垂直 {pg.siFormat(scale_v, suffix='V', precision=6)}/格")
+            self.window_legend.setText(" · ".join(scales))
+        follow_pulse = self.scope_follow_pulse and (first_frame or frame.pulse_view_ns != previous.pulse_view_ns)
+        rendered_frame = self.scope_rendered[0]
         self.displayed_frame = frame
+        if rendered_frame is None or (frame.voltage_range_v, scale_v) != (
+                rendered_frame.voltage_range_v, rendered_frame.vertical_scale_v):
+            self.set_scope_voltage_view(frame)
         if follow_pulse:
             self.set_scope_view(frame)
         self.render_scope_curve()
@@ -1010,6 +1042,15 @@ class WaveformWindow(W.QMainWindow):
         else:
             self.plot.setXRange(*frame.pulse_view_ns, padding=0)
 
+    def set_scope_voltage_view(self, frame):
+        if frame.voltage_range_v is None:
+            self.voltage_axis.set_scope_division(None)
+            self.plot.enableAutoRange(y=True)
+            return
+        low_v, high_v = frame.voltage_range_v
+        self.voltage_axis.set_scope_division(frame.vertical_scale_v, low_v)
+        self.plot.setYRange(low_v, high_v, padding=0)
+
     def render_scope_curve(self):
         frame = self.displayed_frame
         if frame is None:
@@ -1036,7 +1077,7 @@ class WaveformWindow(W.QMainWindow):
     def reset_zoom(self):
         if self.displayed_frame is not None:
             self.scope_follow_pulse = True
-            self.plot.enableAutoRange(y=True)
+            self.set_scope_voltage_view(self.displayed_frame)
             self.set_scope_view(self.displayed_frame)
             self.render_scope_curve()
             return
@@ -1050,8 +1091,8 @@ class WaveformWindow(W.QMainWindow):
         self.scope_rendered = (None, None)
         self.plot.clear()
         self.time_axis.set_scope_division(None)
+        self.voltage_axis.set_scope_division(None)
         self.plot.setLabel("bottom", "相对上升 50% 交点", units="ns", color="#6b7280")
-        self.plot.getViewBox().setAutoVisible(y=False)
         self.plot.setRange(xRange=(0, 100), yRange=(0, 1), padding=0)
         self.scope_follow_pulse = True
         self.window_legend.setText("保持期 · 红区 y0–y2 · 蓝区参考")

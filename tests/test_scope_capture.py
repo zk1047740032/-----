@@ -14,6 +14,7 @@ from waveform_simulation import ScopeEvaluationSettings, run_evaluation, simulat
 PREAMBLE = (b':WFMOUTPRE:BYT_NR 2;BIT_NR 16;ENCDG BINARY;BN_FMT RI;BYT_OR MSB;'
             b'WFID "Ch2, DC coupling, 20 points, Sample mode";NR_PT 20;PT_FMT Y;XUNIT "s";'
             b'XINCR 2E-9;XZERO -8E-9;PT_OFF 0;YUNIT "V";YMULT 0.002;YOFF 10;YZERO 0.13;:CURVE ')
+DISPLAY_QUERY = b"HORIZONTAL:SCALE?;:CH2:SCALE?;POSITION?;OFFSET?\n"
 
 
 class ScopeCaptureTests(unittest.TestCase):
@@ -30,8 +31,9 @@ class ScopeCaptureTests(unittest.TestCase):
     def test_horizontal_scale_is_read_for_each_frame_independently_of_sample_spacing(self):
         capture = b":HORIZONTAL:RECORDLENGTH 20\n" + PREAMBLE + b"#240" + bytes(40) + b"\n"
         shifted = capture.replace(b"XINCR 2E-9;XZERO -8E-9", b"XINCR 4E-9;XZERO -16E-9")
-        stream = BytesIO(capture + b":HORIZONTAL:SCALE 4.0000E-8\n"
-                         + capture + b"8.0000E-8\n" + shifted + b"8.0000E-8\n" + capture + b"0\n")
+        stream = BytesIO(capture + b":HORIZONTAL:SCALE 4.0000E-8;:CH2:SCALE 0.5;:CH2:POSITION 0;:CH2:OFFSET 0\n"
+                         + capture + b"8.0000E-8;0.5;0;0\n" + shifted + b"8.0000E-8;0.5;0;0\n"
+                         + capture + b"0;0.5;0;0\n")
         socket = Mock()
         scope = ScopeConnection(socket, stream)
         first = scope.read_frame()
@@ -45,7 +47,23 @@ class ScopeCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "水平标度无效"):
             scope.read_frame()
         commands = [call.args[0] for call in socket.sendall.call_args_list]
-        self.assertEqual(commands.count(b"HORIZONTAL:SCALE?\n"), 4)
+        self.assertEqual(commands.count(DISPLAY_QUERY), 4)
+
+    def test_vertical_display_range_follows_channel_settings(self):
+        capture = b"20\n" + PREAMBLE + b"#240" + bytes(40) + b"\n"
+        stream = BytesIO(capture + b"40e-9;0.5;-2;0.125\n" + capture + b"40e-9;0.25;1.5;-0.125\n"
+                         + capture + b"40e-9;0.25;1.5;0.125\n" + capture + b"40e-9;0.25;NaN;0.125\n")
+        scope = ScopeConnection(Mock(), stream)
+        first, second, third = (scope.read_frame() for _ in range(3))
+
+        self.assertEqual(first.vertical_scale_v, 0.5)
+        self.assertEqual(first.voltage_range_v, (-0.875, 3.125))
+        self.assertEqual(second.vertical_scale_v, 0.25)
+        self.assertEqual(second.voltage_range_v, (-1.5, 0.5))
+        self.assertEqual(third.voltage_range_v, (-1.25, 0.75))
+        np.testing.assert_array_equal(first.voltage_v, third.voltage_v)
+        with self.assertRaisesRegex(ValueError, "垂直标度、位置或偏置无效"):
+            scope.read_frame()
 
     def test_long_record_keeps_all_samples_and_focuses_the_pulse_nearest_the_trigger(self):
         points = 90_001
@@ -63,7 +81,7 @@ class ScopeCaptureTests(unittest.TestCase):
                 high = (time_ns - rise_ns) % period_ns < width_ns
                 payload = np.where(high, 200, 0).astype(">i2").tobytes()
                 capture = (f"{points}\n".encode() + preamble + f"#6{len(payload)}".encode()
-                           + payload + f"\n{scale_ns}e-9\n".encode())
+                           + payload + f"\n{scale_ns}e-9;0.5;0;0\n".encode())
                 frame = ScopeConnection(Mock(), BytesIO(capture)).read_frame()
 
                 self.assertEqual(frame.time_s.size, points)

@@ -12,6 +12,7 @@ from waveform_core.pulse_metrics import locate_pulses
 
 SCOPE_PORT = 4000
 SCOPE_CHANNEL = "CH2"
+SCOPE_VERTICAL_DIVISIONS = 8
 SCOPE_TIMEOUT_S = 3.0
 MAX_SCOPE_POINTS = 1_000_000
 MAX_TEXT_BYTES = 512
@@ -27,6 +28,8 @@ class ScopeFrame:
     received_at: datetime
     horizontal_scale_s: float | None = None
     pulse_view_ns: tuple[float, float] | None = None
+    vertical_scale_v: float | None = None
+    voltage_range_v: tuple[float, float] | None = None
 
 
 @lru_cache(maxsize=2)
@@ -204,14 +207,22 @@ class ScopeConnection:
             except TimeoutError as error:
                 raise TimeoutError(f"读取波形超时，请确认 {SCOPE_CHANNEL} 已开启并采集到波形。") from error
             if frame.time_s.size == points:
-                scale = self.query("HORIZONTAL:SCALE?").split()
+                settings = self.query(f"HORIZONTAL:SCALE?;:{SCOPE_CHANNEL}:SCALE?;POSITION?;OFFSET?")
                 try:
-                    scale_s = float(scale[-1])
+                    scale_s, scale_v, position_div, offset_v = (
+                        float(field.split()[-1]) for field in settings.split(";"))
                 except (IndexError, ValueError) as error:
-                    raise ValueError("示波器返回的水平标度无效。") from error
+                    raise ValueError("示波器返回的显示标度应答无效。") from error
                 if scale_s <= 0 or not isfinite(scale_s):
                     raise ValueError("示波器返回的水平标度无效。")
+                # The offset voltage appears at the channel position relative to screen center.
+                center_v = offset_v - position_div * scale_v
+                half_span_v = SCOPE_VERTICAL_DIVISIONS / 2 * scale_v
+                low_v, high_v = center_v - half_span_v, center_v + half_span_v
+                if not (scale_v > 0 and isfinite(low_v) and isfinite(high_v) and low_v < high_v):
+                    raise ValueError(f"示波器返回的 {SCOPE_CHANNEL} 垂直标度、位置或偏置无效。")
                 return replace(frame, horizontal_scale_s=scale_s,
-                               pulse_view_ns=_single_pulse_view_ns(frame, scale_s))
+                               pulse_view_ns=_single_pulse_view_ns(frame, scale_s),
+                               vertical_scale_v=scale_v, voltage_range_v=(low_v, high_v))
             self.stop_point = None
         raise ValueError("传回的波形点数与当前记录长度不一致，请重新连接示波器。")
